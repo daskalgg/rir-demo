@@ -12,6 +12,12 @@
   #echo { display: block; width: 520px; max-width: 100%; height: 120px; background: #000; border-radius: 4px; }
   #status { display: block; margin: 4px 0 8px; color: #9cf; }
   small { color: #999; }
+  #settings { margin-top: 8px; padding-top: 8px; border-top: 1px solid #fff2; }
+  #settings h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; color: #bbb; }
+  #settings label { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  #settings label > span:first-child { width: 70px; }
+  #settings input[type=range] { flex: 1; margin: 0; }
+  #settings output { width: 90px; text-align: right; font-variant-numeric: tabular-nums; }
 </style>
 <script type="importmap">
 { "imports": {
@@ -30,8 +36,15 @@
   <label>Room (glTF): <input type="file" id="room" accept=".glb,.gltf" disabled></label><br>
   <canvas id="echo" width="520" height="120"></canvas>
   <small>Echogram of the 4 octave bands (low → high: red, orange, green, blue). Drag to look around with headphones on;
-  WASD moves the listener, then press “Trace” again. No file chosen → a synthetic clap/tone test signal is used.
+  WASD moves the listener, arrow keys move the source. No file chosen → a synthetic clap/tone test signal is used.
   Rooms: .glb or self-contained .gltf, Y-up, metres (or <code>?room=url.glb</code>); default is a 6×3×4 m shoebox.</small>
+  <div id="settings">
+    <h3>Simulation</h3>
+    <label><span>Rays</span><input type="range" id="rays" min="1" max="32" step="1" value="4"><output id="raysOut"></output></label>
+    <label><span>Bounces</span><input type="range" id="bounces" min="1" max="256" step="1" value="64"><output id="bouncesOut"></output></label>
+    <label><input type="checkbox" id="auto" checked><span>Re-trace automatically when the listener, source or settings change</span></label>
+    <small>Trace time grows with rays × bounces. The sound cross-fades to each new RIR once it’s ready.</small>
+  </div>
 </div>
 <script type="module" src="demo.js"></script>
 </body>

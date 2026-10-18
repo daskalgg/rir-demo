@@ -127,16 +127,25 @@ canvas.addEventListener('pointermove', (e) => {
   pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.004, -1.5, 1.5);
 });
 addEventListener('keydown', (e) => {
-  const step = 0.25, f = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw)), r = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
-  if (e.key === 'w') camera.position.addScaledVector(f, step);
-  if (e.key === 's') camera.position.addScaledVector(f, -step);
-  if (e.key === 'd') camera.position.addScaledVector(r, step);
-  if (e.key === 'a') camera.position.addScaledVector(r, -step);
-  camera.position.clamp(roomBox.min.clone().addScalar(0.3), roomBox.max.clone().subScalar(0.3));
+    const step = 0.25, f = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw)), r = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+    if (e.key === 'w') camera.position.addScaledVector(f, step);
+    if (e.key === 's') camera.position.addScaledVector(f, -step);
+    if (e.key === 'd') camera.position.addScaledVector(r, step);
+    if (e.key === 'a') camera.position.addScaledVector(r, -step);
+    camera.position.clamp(roomBox.min.clone().addScalar(0.3), roomBox.max.clone().subScalar(0.3));
+
+    if (e.key == 'ArrowUp') sourceMesh.position.addScaledVector(f, step);
+    if (e.key == 'ArrowDown') sourceMesh.position.addScaledVector(f, -step);
+    if (e.key == 'ArrowRight') sourceMesh.position.addScaledVector(r, step);
+    if (e.key == 'ArrowLeft') sourceMesh.position.addScaledVector(r, -step);
+    sourceMesh.position.clamp(roomBox.min.clone().addScalar(0.3), roomBox.max.clone().subScalar(0.3));
+    sourcePos.copy(sourceMesh.position);        // uSource holds sourcePos
+
+    if (['w', 'a', 's', 'd', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) requestTrace();
 });
 
 /* ---------------------------------------------------------------- tracer + auralizer */
-const aur = new RIRAuralizer({ speakers: 'cube' });
+const aur = new RIRAuralizer({ speakers: 'cube', crossfade: 0.4 });
 let tracer = null;
 
 async function init() {
@@ -148,7 +157,7 @@ async function init() {
     source: sourcePos,
     surfelRadius: room.surfelRadius,
     cameraRelative: false,            // directions in WORLD axes -> head tracking via AudioListener, no re-trace
-    rayTexSize: 128, batches: 4, maxBounces: 64,
+    rayTexSize: RAY_TEX, batches: +$('rays').value, maxBounces: +$('bounces').value,
     absorption: new THREE.Vector4(0.20, 0.25, 0.30, 0.35),
   });
   aur.loadAnechoic(makeTestSignal(aur.ctx));
@@ -157,6 +166,7 @@ async function init() {
   status(`ready — ${room.count} surfels`);
   const url = new URLSearchParams(location.search).get('room');
   if (url) await loadRoom(url, url.split('/').pop());
+  requestTrace(0);
 }
 
 /* ---------------------------------------------------------------- glTF rooms */
@@ -187,30 +197,63 @@ async function loadRoom(src, name) {           // src: URL string or File
   camera.far = Math.max(50, 2 * roomBox.getSize(new THREE.Vector3()).length());
   camera.updateProjectionMatrix();
 
-  status(`${name}: ${tris.length} triangles → ${room.count} surfels, r = ${room.surfelRadius.toFixed(3)} m — trace again`);
+  status(`${name}: ${tris.length} triangles → ${room.count} surfels, r = ${room.surfelRadius.toFixed(3)} m`);
+  requestTrace(0);
 }
+
+/* ---------------------------------------------------------------- settings panel */
+// rays are added in batches of RAY_TEX^2: a bigger per-pass texture risks the GPU watchdog (each ray scans every surfel)
+const RAY_TEX = 128;
+function updateSettings() {
+  const batches = +$('rays').value, bounces = +$('bounces').value;
+  $('raysOut').textContent = (batches * RAY_TEX * RAY_TEX).toLocaleString();
+  $('bouncesOut').textContent = bounces;
+  if (tracer) { tracer.setBatches(batches); tracer.setMaxBounces(bounces); }
+}
+$('rays').oninput = $('bounces').oninput = updateSettings;
+$('rays').onchange = $('bounces').onchange = () => requestTrace();   // on release, not on every drag step
+updateSettings();
 
 $('room').onchange = async (e) => {
   const f = e.target.files[0];
   if (!f) return;
-  $('trace').disabled = true;
   try { await loadRoom(f, f.name); } catch (err) { console.error(err); status('error: ' + err.message); }
-  $('trace').disabled = false;
 };
 
-$('trace').onclick = async () => {
-  $('trace').disabled = true;
-  status('ray tracing…');
-  await new Promise((r) => setTimeout(r, 30));
-  const t0 = performance.now();
-  tracer.run();
-  status('synthesizing impulse response…');
-  await aur.setRIRFromTracer(tracer);           // reads back the GPU result, builds IRs, swaps convolvers
-  drawEchogram(tracer.readOmni(), tracer.opts.numBins);
-  status(`RIR ready (${((performance.now() - t0) / 1000).toFixed(1)} s)`);
-  $('trace').disabled = false;
-  $('play').disabled = false;
-};
+/* ---------------------------------------------------------------- (re)tracing */
+// Changes are debounced, and at most one trace runs at a time: a change during a trace queues exactly one
+// more, which picks up the latest state. The auralizer cross-fades to each new RIR.
+let tracing = false, traceQueued = false, traceTimer = 0;
+
+function requestTrace(delay = 250) {
+  if (!tracer || !$('auto').checked) return;
+  clearTimeout(traceTimer);
+  traceTimer = setTimeout(trace, delay);
+}
+
+async function trace() {
+  if (tracing) { traceQueued = true; return; }
+  tracing = true;
+  try {
+    status('ray tracing…');
+    await new Promise((r) => setTimeout(r, 30));  // let the status repaint
+    const t0 = performance.now();
+    tracer.run();
+    status('synthesizing impulse response…');
+    await aur.setRIRFromTracer(tracer);         // reads back the GPU result, builds IRs, cross-fades convolvers
+    drawEchogram(tracer.readOmni(), tracer.opts.numBins);
+    status(`RIR ready (${((performance.now() - t0) / 1000).toFixed(1)} s)`);
+    $('play').disabled = false;
+  } catch (e) {
+    console.error(e); status('error: ' + e.message);
+  } finally {
+    tracing = false;
+  }
+  if (traceQueued) { traceQueued = false; trace(); }
+}
+
+$('trace').onclick = () => trace();
+$('auto').onchange = () => requestTrace(0);
 
 let playing = false;
 $('play').onclick = async () => {

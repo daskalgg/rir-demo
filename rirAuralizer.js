@@ -11,9 +11,11 @@
 //        independent noise per speaker so the reverb tail is decorrelated.
 //        The direct sound is added analytically as a clean, correctly panned impulse.
 //   3. RIRAuralizer (Web Audio)
-//        anechoic mono source -> K x ConvolverNode (one IR per speaker)
-//                             -> K x PannerNode (HRTF, placed at the speaker direction)
+//        anechoic mono source -> bank gain -> K x ConvolverNode (one IR per speaker)
+//                             -> K x PannerNode (HRTF, placed at the speaker direction; shared by all banks)
 //                             -> master gain -> destination
+//        A new IR gets a new bank; the switch cross-fades the bank INPUTS, so the old convolvers ring out
+//        their tail naturally and the new ones build up from silence (no output discontinuity -> no click).
 //
 // HEAD TRACKING (no re-trace needed): trace with  cameraRelative:false  in RIRTracer. The speakers
 // are then in WORLD axes and setListenerFromCamera(camera) rotates the Web Audio listener with the
@@ -203,12 +205,15 @@ export class RIRAuralizer {
    * @param opts.audioContext  existing AudioContext (optional)
    * @param opts.speakers      array of unit vectors, or a name from SPEAKER_LAYOUTS (default 'icosahedron')
    * @param opts.panExponent   directional lobe sharpness for distributing energy over speakers (default 4)
+   * @param opts.crossfade     seconds to cross-fade from the old IR to a new one (default 0.4)
    */
   constructor(opts = {}) {
     this.ctx = opts.audioContext || new (window.AudioContext || window.webkitAudioContext)();
     const sp = opts.speakers || 'icosahedron';
     this.speakers = typeof sp === 'string' ? SPEAKER_LAYOUTS[sp]() : sp;
     this.panExponent = opts.panExponent ?? 4;
+    this.crossfade = opts.crossfade ?? 0.4;
+    this._fadeDone = Promise.resolve();
     this.worldFrame = false;
     this.anechoic = null;
     this.srcNode = null;
@@ -223,6 +228,18 @@ export class RIRAuralizer {
     this.master = this.ctx.createGain();
     this.master.gain.value = 0.5;
     this.master.connect(this.ctx.destination);
+
+    // one HRTF panner per virtual speaker; built once so a new IR never restarts the HRTF state
+    this.panners = this.speakers.map((s) => {
+      const pan = this.ctx.createPanner();
+      pan.panningModel = 'HRTF';
+      pan.distanceModel = 'linear';
+      pan.rolloffFactor = 0;                  // no distance gain: level is already inside the IR
+      pan.refDistance = 1;
+      pan.positionX.value = s[0]; pan.positionY.value = s[1]; pan.positionZ.value = s[2];
+      pan.connect(this.master);
+      return pan;
+    });
   }
 
   setGain(g) { this.master.gain.value = g; }
@@ -253,7 +270,7 @@ export class RIRAuralizer {
     });
   }
 
-  /** data: see synthesizeSpeakerIR (+ optional worldFrame flag). Cross-fades if already playing. */
+  /** data: see synthesizeSpeakerIR (+ optional worldFrame flag). Cross-fades from the previous IR. */
   async setRIR(data) {
     this.worldFrame = !!data.worldFrame;
     if (!this.worldFrame) this._setListenerOrientation(0, 0, -1, 0, 1, 0);
@@ -264,14 +281,24 @@ export class RIRAuralizer {
       sampleRate: this.ctx.sampleRate, panExponent: this.panExponent,
     });
 
-    const bank = this._buildBank(ir);
-    const old = this.bank, t = this.ctx.currentTime;
-    bank.gain.gain.setValueAtTime(0, t);
-    bank.gain.gain.linearRampToValueAtTime(1, t + 0.08);
-    if (old) {
-      old.gain.gain.setValueAtTime(1, t);
-      old.gain.gain.linearRampToValueAtTime(0, t + 0.08);
-      setTimeout(() => this._disposeBank(old), 250);
+    // one fade at a time: a value curve can't be interrupted portably (no cancelAndHoldAtTime in Firefox)
+    await this._fadeDone;
+    const bank = this._buildBank(ir);         // starts silent (input gain 0)
+    const old = this.bank, t = this.ctx.currentTime + 0.01, T = Math.max(this.crossfade, 0.01);
+    if (!old) {
+      bank.gain.gain.value = 1;
+    } else {
+      // equal-power: the two reverbs are uncorrelated, so a linear fade would dip ~3 dB mid-way
+      const N = 64, fadeIn = new Float32Array(N), fadeOut = new Float32Array(N);
+      for (let i = 0; i < N; i++) {
+        const x = i / (N - 1) * Math.PI / 2;
+        fadeIn[i] = Math.sin(x); fadeOut[i] = Math.cos(x);
+      }
+      bank.gain.gain.setValueCurveAtTime(fadeIn, t, T);
+      old.gain.gain.setValueCurveAtTime(fadeOut, t, T);
+      this._fadeDone = new Promise((r) => setTimeout(r, (T + 0.05) * 1000));
+      // the old convolvers are still ringing out what they received before the fade; free them once that's gone
+      setTimeout(() => this._disposeBank(old), (T + ir.length / ir.sampleRate + 0.1) * 1000);
     }
     this.bank = bank;
     return ir;
@@ -280,9 +307,8 @@ export class RIRAuralizer {
   _buildBank(ir) {
     const ctx = this.ctx;
     const gain = ctx.createGain();
-    gain.connect(this.master);
-    const convs = [], pans = [];
-    this.speakers.forEach((s, k) => {
+    gain.gain.value = 0;                      // silent BEFORE it is connected
+    const convs = this.panners.map((pan, k) => {
       const buf = ctx.createBuffer(1, ir.length, ir.sampleRate);
       buf.copyToChannel(ir.channels[k], 0);
 
@@ -290,25 +316,18 @@ export class RIRAuralizer {
       conv.normalize = false;                 // MUST be set before .buffer, or the IR gets rescaled
       conv.buffer = buf;
 
-      const pan = ctx.createPanner();
-      pan.panningModel = 'HRTF';
-      pan.distanceModel = 'linear';
-      pan.rolloffFactor = 0;                  // no distance gain: level is already inside the IR
-      pan.refDistance = 1;
-      pan.positionX.value = s[0]; pan.positionY.value = s[1]; pan.positionZ.value = s[2];
-
-      this.input.connect(conv);
+      gain.connect(conv);
       conv.connect(pan);
-      pan.connect(gain);
-      convs.push(conv); pans.push(pan);
+      return conv;
     });
-    return { gain, convs, pans };
+    this.input.connect(gain);
+    return { gain, convs };
   }
 
   _disposeBank(bank) {
-    bank.convs.forEach((c) => { try { this.input.disconnect(c); } catch (e) { /* already gone */ } c.disconnect(); });
-    bank.pans.forEach((p) => p.disconnect());
+    try { this.input.disconnect(bank.gain); } catch (e) { /* already gone */ }
     bank.gain.disconnect();
+    bank.convs.forEach((c) => c.disconnect());
   }
 
   async play({ loop = true, offset = 0 } = {}) {

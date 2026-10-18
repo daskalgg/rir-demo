@@ -207,6 +207,17 @@ export class RIRTracer {
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
   }
 
+  /** Total rays = batches * rayTexSize^2. Takes effect on the next run(). */
+  setBatches(batches) {
+    const o = this.opts;
+    o.batches = batches;
+    // uniform object is shared by both accumulate materials
+    this.omniMat.uniforms.uRayWeight.value = 1 / (batches * o.rayTexSize ** 2 * Math.PI * o.listenerRadius ** 2);
+  }
+
+  /** Bounces traced per ray. Takes effect on the next run(). */
+  setMaxBounces(n) { this.opts.maxBounces = n; }
+
   /** Copy camera position / orientation into the listener uniforms. */
   updateListener() {
     const o = this.opts;
