@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GPU ray-traced RIR auralization</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 14px system-ui, sans-serif; overflow: hidden; }
+  canvas#view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
+  #ui { position: fixed; top: 10px; left: 10px; background: #000a; padding: 10px 12px; border-radius: 8px; max-width: 540px; }
+  #ui button, #ui input { margin: 0 6px 6px 0; }
+  #echo { display: block; width: 520px; max-width: 100%; height: 120px; background: #000; border-radius: 4px; }
+  #status { display: block; margin: 4px 0 8px; color: #9cf; }
+  small { color: #999; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="view"></canvas>
+<div id="ui">
+  <span id="status">loading…</span>
+  <button id="trace" disabled>1. Trace RIR from here</button>
+  <button id="play" disabled>2. Play / stop</button><br>
+  <label>Anechoic file: <input type="file" id="file" accept="audio/*"></label><br>
+  <label>Room (glTF): <input type="file" id="room" accept=".glb,.gltf" disabled></label><br>
+  <canvas id="echo" width="520" height="120"></canvas>
+  <small>Echogram of the 4 octave bands (low → high: red, orange, green, blue). Drag to look around with headphones on;
+  WASD moves the listener, then press “Trace” again. No file chosen → a synthetic clap/tone test signal is used.
+  Rooms: .glb or self-contained .gltf, Y-up, metres (or <code>?room=url.glb</code>); default is a 6×3×4 m shoebox.</small>
+</div>
+<script type="module" src="demo.js"></script>
+</body>
+</html>
