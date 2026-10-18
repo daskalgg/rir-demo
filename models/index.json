@@ -16,6 +16,10 @@
     "name": "Ellipse"
   },
   {
+    "file": "ellipse-flat.glb",
+    "name": "Ellipse (flat ceiling)"
+  },
+  {
     "file": "flat-chamber.glb",
     "name": "Flat chamber"
   }

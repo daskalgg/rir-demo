@@ -116,7 +116,8 @@ export class RIRTracer {
       listener: new THREE.Vector3(),   // used only when no camera is given
       source: new THREE.Vector3(),
       rayTexSize: 128,            // 128x128 = 16384 rays per batch
-      batches: 8,                 // total rays = batches * rayTexSize^2
+      batches: 8,                 // total rays = batches * rayTexSize^2, unless `rays` is given
+      rays: undefined,            // total rays, in whole rows of rayTexSize (the last batch may be partial)
       maxBounces: 64,
       speedOfSound: 343,
       listenerRadius: 0.15,
@@ -133,6 +134,7 @@ export class RIRTracer {
       atlasCols: 8,
     }, opts);
     o.atlasRows = Math.ceil(o.numSlices / o.atlasCols);
+    if (o.rays === undefined) o.rays = o.batches * o.rayTexSize ** 2;
     o.bands = BANDS;                // fixed: the shaders accumulate exactly two groups of 4 bands
 
     this.read = floatTarget(o.rayTexSize, o.rayTexSize, 3);     // state0, state1, hit
@@ -171,7 +173,6 @@ export class RIRTracer {
 
     // ---- accumulate passes (one point per ray, additive blending)
     const nRays = o.rayTexSize * o.rayTexSize;
-    const totalRays = o.batches * nRays;
     const groups = (a) => [new THREE.Vector4().fromArray(a, 0), new THREE.Vector4().fromArray(a, 4)];
     const common = {
       uHit: { value: null },
@@ -179,7 +180,7 @@ export class RIRTracer {
       uAbsorption: { value: groups(o.absorption) },
       uAirAbsorption: { value: groups(o.airAbsorption) },
       uGroup: { value: 0 },
-      uRayWeight: { value: 1 / (totalRays * Math.PI * o.listenerRadius ** 2) },
+      uRayWeight: { value: 0 },                 // set by setRayCount()
     };
     const additive = {
       glslVersion: THREE.GLSL3, fragmentShader: ACCUM_FRAG,
@@ -203,7 +204,7 @@ export class RIRTracer {
       },
     });
 
-    const g = new THREE.BufferGeometry();
+    const g = this._rayGeometry = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(nRays * 3), 3));
     const mkScene = (mat) => {
       const s = new THREE.Scene();
@@ -216,15 +217,21 @@ export class RIRTracer {
     this.dirScene = mkScene(this.dirMat);
 
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    this.setRayCount(o.rays);
+  }
+
+  /** Total rays, rounded down to whole rows of the ray texture (>= one row). Runs as full rayTexSize^2 batches plus
+   *  one partial batch for the remainder. Takes effect on the next run(). */
+  setRayCount(rays) {
+    const o = this.opts, row = o.rayTexSize;
+    o.rays = Math.max(row, Math.floor(rays / row) * row);
+    o.batches = Math.ceil(o.rays / (row * row));
+    // uniform object is shared by both accumulate materials
+    this.omniMat.uniforms.uRayWeight.value = 1 / (o.rays * Math.PI * o.listenerRadius ** 2);
   }
 
   /** Total rays = batches * rayTexSize^2. Takes effect on the next run(). */
-  setBatches(batches) {
-    const o = this.opts;
-    o.batches = batches;
-    // uniform object is shared by both accumulate materials
-    this.omniMat.uniforms.uRayWeight.value = 1 / (batches * o.rayTexSize ** 2 * Math.PI * o.listenerRadius ** 2);
-  }
+  setBatches(batches) { this.setRayCount(batches * this.opts.rayTexSize ** 2); }
 
   /** Bounces traced per ray. Takes effect on the next run(). */
   setMaxBounces(n) { this.opts.maxBounces = n; }
@@ -293,13 +300,21 @@ export class RIRTracer {
     for (const t of [this.omniTarget, this.dirTarget]) { r.setRenderTarget(t); r.clear(); }
 
     let seed = 1;
-    for (let b = 0; b < this.opts.batches; b++) {
+    const o = this.opts, size = o.rayTexSize;
+    for (let b = 0; b < o.batches; b++) {
+      // a partial last batch traces only its first `rows` rows (scissor) and splats only those rays (draw range)
+      const rows = Math.min(size, (o.rays - b * size * size) / size), partial = rows < size;
+      for (const t of [this.read, this.write]) { t.scissor.set(0, 0, size, rows); t.scissorTest = partial; }
+      this._rayGeometry.setDrawRange(0, partial ? rows * size : Infinity);
+
       this._tracePass(true, seed++);                       // emit
-      for (let k = 0; k < this.opts.maxBounces; k++) {
+      for (let k = 0; k < o.maxBounces; k++) {
         this._tracePass(false, seed++);                    // one bounce for all rays
         this._accumulate();                                // splat listener hits
       }
     }
+    for (const t of [this.read, this.write]) t.scissorTest = false;
+    this._rayGeometry.setDrawRange(0, Infinity);
 
     r.setRenderTarget(prevTarget);
     r.autoClear = prevAuto;

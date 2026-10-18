@@ -1,7 +1,11 @@
-// Generates ellipse.glb: an elliptical "whispering gallery". Flat elliptical floor, vertical elliptical walls up
-// to head height, and above that the upper half of a prolate spheroid whose foci are at head height.
-// Every ray leaving one focus upwards reflects off the dome straight through the other focus; rays leaving
-// downwards (floor + walls) still converge on the vertical line through it.
+// Generates two elliptical rooms on the same 20 x 12 m elliptical floor, foci at head height:
+//   ellipse.glb       "whispering gallery": vertical walls up to head height, and above that the upper half of a
+//                     prolate spheroid whose foci are at head height. Every ray leaving one focus upwards reflects
+//                     off the dome straight through the other focus; rays leaving downwards still converge on the
+//                     vertical line through it.
+//   ellipse-flat.glb  elliptic cylinder: the same walls carried straight up to a flat ceiling at the dome's top
+//                     height. Only the horizontal projection focuses (onto the vertical line through the other
+//                     focus); floor / ceiling reflections spread the arrivals over height.
 // Y-up, metres, major axis along X. Empty nodes "Source" / "Listener" sit exactly on the two foci.
 //
 //   node models/make-ellipse.mjs
@@ -25,15 +29,22 @@ for (let i = 0; i < NT; i++) for (let j = 0; j < NP; j++) {
 
 // walls and floor share the dome's rim vertices: t = theta on the +Z side, t = 2pi - theta on the -Z side
 const N = 2 * NT, tAt = (k) => 2 * Math.PI * k / N;
-const walls = new Part('Walls', [0.74, 0.7, 0.62, 1]);
-const floor = new Part('Floor', [0.5, 0.44, 0.38, 1]);
-for (let k = 0; k < N; k++) {
-  const t0 = tAt(k), t1 = tAt(k + 1), tm = (t0 + t1) / 2;
-  walls.poly([E(t0, 0), E(t1, 0), E(t1, H), E(t0, H)], norm([-Math.cos(tm) / A, 0, -Math.sin(tm) / B]));
-  floor.poly([[0, 0, 0], E(t0, 0), E(t1, 0)], [0, 1, 0]);
+function walls(height) {
+  const part = new Part('Walls', [0.74, 0.7, 0.62, 1]);
+  for (let k = 0; k < N; k++) {
+    const t0 = tAt(k), t1 = tAt(k + 1), tm = (t0 + t1) / 2;
+    part.poly([E(t0, 0), E(t1, 0), E(t1, height), E(t0, height)], norm([-Math.cos(tm) / A, 0, -Math.sin(tm) / B]));
+  }
+  return part;
 }
+function disc(name, color, y, n) {               // elliptical floor / ceiling, fan from the centre
+  const part = new Part(name, color);
+  for (let k = 0; k < N; k++) part.poly([[0, y, 0], E(tAt(k), y), E(tAt(k + 1), y)], n);
+  return part;
+}
+const floor = disc('Floor', [0.5, 0.44, 0.38, 1], 0, [0, 1, 0]);
+const markers = { Source: [-C, H, 0], Listener: [C, H, 0] };
 
-writeGlb(new URL('./ellipse.glb', import.meta.url), 'Ellipse', [dome, walls, floor], {
-  Source: [-C, H, 0],
-  Listener: [C, H, 0],
-});
+writeGlb(new URL('./ellipse.glb', import.meta.url), 'Ellipse', [dome, walls(H), floor], markers);
+writeGlb(new URL('./ellipse-flat.glb', import.meta.url), 'Ellipse (flat ceiling)',
+  [walls(H + B), disc('Ceiling', [0.86, 0.82, 0.74, 1], H + B, [0, -1, 0]), floor], markers);

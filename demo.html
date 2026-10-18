@@ -36,7 +36,8 @@
 <script type="importmap">
 { "imports": {
   "three": "./node_modules/three/build/three.module.js",
-  "three/addons/": "./node_modules/three/examples/jsm/"
+  "three/addons/": "./node_modules/three/examples/jsm/",
+  "omnitone": "./node_modules/omnitone/build/omnitone.esm.js"
 } }
 </script>
 </head>
@@ -45,7 +46,8 @@
 <div id="ui">
   <span id="status">loading…</span>
   <button id="trace" disabled>1. Trace RIR from here</button>
-  <button id="play" disabled>2. Play / stop</button><br>
+  <button id="play" disabled>2. Play / stop</button>
+  <button id="export" disabled title="ambisonic RIR at the selected order (3rd order in speaker mode), AmbiX (ACN / SN3D), float WAV">Export ARIR (AmbiX .wav)</button><br>
   <label>Sound: <select id="soundSelect"><option value="test">Test signal (claps + tones)</option></select></label>
   <label>or open an audio file: <input type="file" id="file" accept="audio/*"></label><br>
   <label>Room: <select id="roomSelect" disabled></select></label>
@@ -59,8 +61,13 @@
   from disk, Y-up, metres; <code>?room=url.glb</code> preselects one.</small>
   <div id="settings">
     <h3>Simulation</h3>
-    <label><span>Rays</span><input type="range" id="rays" min="1" max="32" step="1" value="4"><output id="raysOut"></output></label>
+    <label><span>Rays</span><input type="range" id="rays" min="1" max="64" step="1" value="8"><output id="raysOut"></output></label>
     <label><span>Bounces</span><input type="range" id="bounces" min="1" max="256" step="1" value="64"><output id="bouncesOut"></output></label>
+    <label><span>Rendering</span><select id="render">
+      <option value="ambisonic:3">Ambisonics, 3rd order → binaural (Omnitone)</option>
+      <option value="ambisonic:1">Ambisonics, 1st order → binaural (Omnitone)</option>
+      <option value="speakers">8 virtual speakers × HRTF panners</option>
+    </select></label>
     <label><span>Material</span><select id="material"></select></label>
     <div id="coefs"></div>   <!-- band headers + inputs are built by demo.js from BANDS -->
     <label><input type="checkbox" id="auto" checked><span>Re-trace automatically when the listener, source or settings change</span></label>

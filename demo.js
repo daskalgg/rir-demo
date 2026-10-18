@@ -138,6 +138,8 @@ async function init() {
   try { sounds = await (await fetch('./sounds/index.json')).json(); } catch (e) { console.warn('no sounds/index.json', e); }
   for (const snd of sounds) $('soundSelect').append(new Option(snd.name, 'sounds/' + snd.file));
 
+  await applyRenderMode();                      // loads Omnitone for the ambisonic renderer
+
   // rooms in models/ (index.json is written by the generators / models/build-index.mjs), plus ?room=url
   let rooms = [];
   try { rooms = await (await fetch('./models/index.json')).json(); } catch (e) { console.warn('no models/index.json', e); }
@@ -173,7 +175,7 @@ async function loadRoom(src, name) {           // src: URL string or File
       source: sourcePos,
       surfelRadius: room.surfelRadius,
       cameraRelative: false,          // directions in WORLD axes -> head tracking via AudioListener, no re-trace
-      rayTexSize: RAY_TEX, batches: +$('rays').value, maxBounces: +$('bounces').value,
+      rayTexSize: RAY_TEX, rays: +$('rays').value * RAY_STEP, maxBounces: +$('bounces').value,
       absorption: DEFAULT_MATERIAL.absorption, scattering: DEFAULT_MATERIAL.scattering,
     });
     $('trace').disabled = false;
@@ -220,13 +222,14 @@ async function loadRoom(src, name) {           // src: URL string or File
 }
 
 /* ---------------------------------------------------------------- settings panel */
-// rays are added in batches of RAY_TEX^2: a bigger per-pass texture risks the GPU watchdog (each ray scans every surfel)
-const RAY_TEX = 128;
+// rays are traced in batches of RAY_TEX^2: a bigger per-pass texture risks the GPU watchdog (each ray scans every
+// surfel). The slider counts half batches (RAY_STEP); an odd count ends with a half batch.
+const RAY_TEX = 128, RAY_STEP = RAY_TEX * RAY_TEX / 2;
 function updateSettings() {
-  const batches = +$('rays').value, bounces = +$('bounces').value;
-  $('raysOut').textContent = (batches * RAY_TEX * RAY_TEX).toLocaleString();
+  const rays = +$('rays').value * RAY_STEP, bounces = +$('bounces').value;
+  $('raysOut').textContent = rays.toLocaleString();
   $('bouncesOut').textContent = bounces;
-  if (tracer) { tracer.setBatches(batches); tracer.setMaxBounces(bounces); }
+  if (tracer) { tracer.setRayCount(rays); tracer.setMaxBounces(bounces); }
 }
 $('rays').oninput = $('bounces').oninput = updateSettings;
 $('rays').onchange = $('bounces').onchange = () => requestTrace();   // on release, not on every drag step
@@ -321,6 +324,7 @@ async function trace() {
     status(`RIR ready (${((performance.now() - t0) / 1000).toFixed(1)} s)` +
       (ir.level < 1 ? ` · turned down ${(-20 * Math.log10(ir.level)).toFixed(1)} dB to avoid clipping` : ''));
     $('play').disabled = false;
+    $('export').disabled = false;
   } catch (e) {
     console.error(e); status('error: ' + e.message);
   } finally {
@@ -331,6 +335,32 @@ async function trace() {
 
 $('trace').onclick = () => trace();
 $('auto').onchange = () => requestTrace(0);
+
+// render mode: switching re-synthesises the current RIR in the other format (no re-trace) and cross-fades
+async function applyRenderMode() {
+  const [mode, order] = $('render').value.split(':');   // "speakers" | "ambisonic:<order>"
+  $('render').disabled = true;
+  try {
+    await aur.setMode(mode, order ? +order : undefined);
+    status(`rendering: ${$('render').selectedOptions[0].textContent}`);
+  } catch (err) {
+    console.error(err);
+    if (mode !== 'speakers') { $('render').value = 'speakers'; await aur.setMode('speakers'); }
+    status('ambisonic renderer unavailable (' + (err.message || err) + ') — using virtual speakers');
+  }
+  $('render').disabled = false;
+}
+$('render').onchange = applyRenderMode;
+
+$('export').onclick = () => {
+  const { wav, order } = aur.exportAmbisonicWav();   // 3rd order, synthesised on the spot, in 'speakers' mode
+  const room = ($('roomSelect').selectedOptions[0]?.textContent || 'room').replace(/[^\w.-]+/g, '_');
+  const url = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
+  const a = Object.assign(document.createElement('a'), { href: url, download: `${room}-ARIR-${order}OA-AmbiX-${aur.ctx.sampleRate}Hz.wav` });
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  status(`exported ${a.download} (${(order + 1) ** 2} channels, ACN / SN3D, absolute level)`);
+};
 
 let playing = false;
 $('play').onclick = async () => {
