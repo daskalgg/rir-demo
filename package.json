@@ -1,0 +1,19 @@
+{
+  "name": "rir-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GPU ray-traced room impulse responses with binaural auralization (three.js + Web Audio)",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "nodemon",
+    "models": "node models/make-amphitheater.mjs && node models/make-ellipse.mjs && node models/make-anechoic.mjs && node models/make-flat-chamber.mjs",
+    "index": "node models/build-index.mjs && node sounds/build-index.mjs"
+  },
+  "dependencies": {
+    "three": "0.170.0"
+  },
+  "devDependencies": {
+    "nodemon": "3.1.14"
+  }
+}

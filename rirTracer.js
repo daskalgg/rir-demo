@@ -4,12 +4,15 @@
 // camera's own frame (turn the camera -> the image scrolls), or in world frame if
 // cameraRelative:false.
 //
-// Outputs (both RGBA32F, RGBA = energy of 4 octave bands):
+// Energy is tracked in 8 octave bands (BANDS, 125 Hz .. 16 kHz). The GPU targets are RGBA32F, so each holds two
+// groups of 4 bands side by side; readOmni() / readDirectional() return them interleaved, 8 floats per entry.
 //   tracer.directional : atlas of equirectangular images, one tile per time slice
 //                        tile i -> col = i % cols, row = floor(i / cols)   (row 0 = bottom of texture)
+//                        bands 0-3 in the bottom half of the texture, bands 4-7 stacked above
 //                        each pixel = total ENERGY arriving from that pixel's patch of the sphere
 //                        (divide by pixel solid angle for radiance; see pixelSolidAngle())
-//   tracer.omni        : numBins x 1 fine-resolution energy histogram (sum over all directions)
+//   tracer.omni        : (2 * numBins) x 1 fine-resolution energy histogram (sum over all directions),
+//                        bands 0-3 in x < numBins, bands 4-7 after
 //
 // Usage:
 //   const frag = await (await fetch('./rirTrace.frag')).text();
@@ -24,6 +27,9 @@
 
 import * as THREE from 'three';
 
+/** Octave band centre frequencies (Hz). */
+export const BANDS = [125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+
 const FULLSCREEN_VERT = /* glsl */`
 void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }
 `;
@@ -32,8 +38,9 @@ void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }
 const ACCUM_COMMON = /* glsl */`
 uniform sampler2D uHit;                  // [u, v, pathLength, bounces]  (bounces < 0 -> invalid)
 uniform float uSpeedOfSound;
-uniform vec4  uAbsorption;               // energy absorption per band (0..1)
-uniform vec4  uAirAbsorption;            // 1/m per band (energy)
+uniform vec4  uAbsorption[2];            // energy absorption per band (0..1): bands 0-3, 4-7
+uniform vec4  uAirAbsorption[2];         // 1/m per band (energy)
+uniform int   uGroup;                    // band group accumulated by this pass (0 = bands 0-3, 1 = bands 4-7)
 uniform float uRayWeight;                // 1 / (totalRays * PI * listenerRadius^2)
 out vec4 vEnergy;
 
@@ -42,8 +49,8 @@ vec4 fetchHit() {
     return texelFetch(uHit, ivec2(gl_VertexID % sz.x, gl_VertexID / sz.x), 0);
 }
 vec4 bandEnergy(vec4 h) {
-    vec4 refl = pow(max(vec4(1.0) - uAbsorption, vec4(1e-6)), vec4(h.w));
-    return refl * exp(-uAirAbsorption * h.z) * uRayWeight;
+    vec4 refl = pow(max(vec4(1.0) - uAbsorption[uGroup], vec4(1e-6)), vec4(h.w));
+    return refl * exp(-uAirAbsorption[uGroup] * h.z) * uRayWeight;
 }
 void clipPoint() { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vEnergy = vec4(0.0); gl_PointSize = 1.0; }
 `;
@@ -58,7 +65,7 @@ void main() {
     if (h.w < 0.0 || bin >= float(uNumBins)) { clipPoint(); return; }
     vEnergy = bandEnergy(h);
     gl_PointSize = 1.0;
-    gl_Position = vec4((bin + 0.5) / float(uNumBins) * 2.0 - 1.0, 0.0, 0.0, 1.0);
+    gl_Position = vec4((float(uGroup * uNumBins) + bin + 0.5) / float(2 * uNumBins) * 2.0 - 1.0, 0.0, 0.0, 1.0);
 }
 `;
 
@@ -68,18 +75,18 @@ uniform float uSliceDuration;
 uniform int   uNumSlices;
 uniform int   uCols;
 uniform vec2  uSliceSize;                // pixels per tile (w, h)
-uniform vec2  uAtlasSize;                // pixels (w, h)
+uniform vec2  uAtlasSize;                // pixels (w, h) of ONE band group; the target is twice as high
 void main() {
     vec4 h = fetchHit();
     float slice = floor(h.z / uSpeedOfSound / uSliceDuration);
     if (h.w < 0.0 || slice >= float(uNumSlices)) { clipPoint(); return; }
     int s = int(slice);
-    vec2 tileOrigin = vec2(float(s % uCols), float(s / uCols)) * uSliceSize;
+    vec2 tileOrigin = vec2(float(s % uCols), float(s / uCols)) * uSliceSize + vec2(0.0, float(uGroup) * uAtlasSize.y);
     vec2 inTile = min(floor(h.xy * uSliceSize), uSliceSize - 1.0);
     vec2 p = tileOrigin + inTile + 0.5;
     vEnergy = bandEnergy(h);
     gl_PointSize = 1.0;
-    gl_Position = vec4(p / uAtlasSize * 2.0 - 1.0, 0.0, 1.0);
+    gl_Position = vec4(p / (uAtlasSize * vec2(1.0, 2.0)) * 2.0 - 1.0, 0.0, 1.0);
 }
 `;
 
@@ -114,8 +121,9 @@ export class RIRTracer {
       speedOfSound: 343,
       listenerRadius: 0.15,
       scattering: 0.2,
-      absorption:    new THREE.Vector4(0.10, 0.12, 0.15, 0.20),   // 4 octave bands, energy
-      airAbsorption: new THREE.Vector4(1e-4, 3e-4, 1e-3, 3e-3),   // 1/m
+      absorption:    [0.10, 0.10, 0.12, 0.15, 0.18, 0.20, 0.22, 0.25],   // per band (BANDS), energy
+      // energy attenuation of air, 1/m (ISO 9613-1, 20 °C, 50 % RH)
+      airAbsorption: [1.0e-4, 3.0e-4, 6.3e-4, 1.1e-3, 2.3e-3, 6.8e-3, 2.4e-2, 8.6e-2],
       surfelRadius: 0.1,
       // fine omni histogram
       numBins: 2048, binDuration: 0.0005,                         // ~1.02 s
@@ -125,11 +133,12 @@ export class RIRTracer {
       atlasCols: 8,
     }, opts);
     o.atlasRows = Math.ceil(o.numSlices / o.atlasCols);
+    o.bands = BANDS;                // fixed: the shaders accumulate exactly two groups of 4 bands
 
     this.read = floatTarget(o.rayTexSize, o.rayTexSize, 3);     // state0, state1, hit
     this.write = floatTarget(o.rayTexSize, o.rayTexSize, 3);
-    this.omniTarget = floatTarget(o.numBins, 1);
-    this.dirTarget = floatTarget(o.sliceWidth * o.atlasCols, o.sliceHeight * o.atlasRows);
+    this.omniTarget = floatTarget(2 * o.numBins, 1);                                    // 2 band groups
+    this.dirTarget = floatTarget(o.sliceWidth * o.atlasCols, 2 * o.sliceHeight * o.atlasRows);
     this.omni = this.omniTarget.texture;
     this.directional = this.dirTarget.texture;
 
@@ -144,7 +153,7 @@ export class RIRTracer {
       uniforms: {
         uTex1: { value: o.tex1 }, uTex2: { value: o.tex2 },
         uState0: { value: null }, uState1: { value: null },
-        uInit: { value: 1 }, uSeed: { value: 0 },
+        uInit: { value: 1 }, uSeed: { value: 0 }, uRayTexSize: { value: o.rayTexSize },
         uSource: { value: o.source },
         uListener: { value: this._listenerPos },
         uWorldToListener: { value: this._worldToListener },
@@ -163,11 +172,13 @@ export class RIRTracer {
     // ---- accumulate passes (one point per ray, additive blending)
     const nRays = o.rayTexSize * o.rayTexSize;
     const totalRays = o.batches * nRays;
+    const groups = (a) => [new THREE.Vector4().fromArray(a, 0), new THREE.Vector4().fromArray(a, 4)];
     const common = {
       uHit: { value: null },
       uSpeedOfSound: { value: o.speedOfSound },
-      uAbsorption: { value: o.absorption },
-      uAirAbsorption: { value: o.airAbsorption },
+      uAbsorption: { value: groups(o.absorption) },
+      uAirAbsorption: { value: groups(o.airAbsorption) },
+      uGroup: { value: 0 },
       uRayWeight: { value: 1 / (totalRays * Math.PI * o.listenerRadius ** 2) },
     };
     const additive = {
@@ -218,6 +229,16 @@ export class RIRTracer {
   /** Bounces traced per ray. Takes effect on the next run(). */
   setMaxBounces(n) { this.opts.maxBounces = n; }
 
+  /** Energy absorption per octave band (BANDS), 0..1, as [8]. Takes effect on the next run(). */
+  setAbsorption(a) {
+    this.opts.absorption = [...a];
+    const [lo, hi] = this.omniMat.uniforms.uAbsorption.value;   // shared by both accumulate materials
+    lo.fromArray(a, 0); hi.fromArray(a, 4);
+  }
+
+  /** Fraction of reflections that are diffuse (0 = mirror, 1 = Lambert). Takes effect on the next run(). */
+  setScattering(s) { this.opts.scattering = s; this.traceMat.uniforms.uScattering.value = s; }
+
   /** Copy camera position / orientation into the listener uniforms. */
   updateListener() {
     const o = this.opts;
@@ -250,8 +271,11 @@ export class RIRTracer {
     const hit = this.read.textures[2], r = this.renderer;
     this.omniMat.uniforms.uHit.value = hit;
     this.dirMat.uniforms.uHit.value = hit;
-    r.setRenderTarget(this.omniTarget); r.render(this.omniScene, this.camera);
-    r.setRenderTarget(this.dirTarget);  r.render(this.dirScene, this.camera);
+    for (let g = 0; g < 2; g++) {                        // band groups 0-3, 4-7 (uGroup is shared)
+      this.omniMat.uniforms.uGroup.value = g;
+      r.setRenderTarget(this.omniTarget); r.render(this.omniScene, this.camera);
+      r.setRenderTarget(this.dirTarget);  r.render(this.dirScene, this.camera);
+    }
   }
 
   /** Runs the full simulation. Returns { directional, omni } textures. */
@@ -300,18 +324,22 @@ export class RIRTracer {
     };
   }
 
-  /** Read the atlas back to the CPU (Float32Array, RGBA = 4 bands, atlas row 0 = bottom). */
+  /** Read the atlas back to the CPU: Float32Array(w * h * 8), 8 bands per pixel, atlas row 0 = bottom. */
   readDirectional(out) {
     const o = this.opts, w = o.sliceWidth * o.atlasCols, h = o.sliceHeight * o.atlasRows;
-    out = out || new Float32Array(w * h * 4);
-    this.renderer.readRenderTargetPixels(this.dirTarget, 0, 0, w, h, out);
+    const raw = new Float32Array(w * 2 * h * 4);
+    this.renderer.readRenderTargetPixels(this.dirTarget, 0, 0, w, 2 * h, raw);
+    out = out || new Float32Array(w * h * 8);
+    for (let p = 0; p < w * h; p++) for (let g = 0; g < 2; g++) for (let c = 0; c < 4; c++) out[p * 8 + g * 4 + c] = raw[(g * w * h + p) * 4 + c];
     return out;
   }
 
-  /** Read the fine omni histogram back to the CPU. */
+  /** Read the fine omni histogram back to the CPU: Float32Array(numBins * 8), 8 bands per bin. */
   readOmni(out) {
-    out = out || new Float32Array(this.opts.numBins * 4);
-    this.renderer.readRenderTargetPixels(this.omniTarget, 0, 0, this.opts.numBins, 1, out);
+    const n = this.opts.numBins, raw = new Float32Array(2 * n * 4);
+    this.renderer.readRenderTargetPixels(this.omniTarget, 0, 0, 2 * n, 1, raw);
+    out = out || new Float32Array(n * 8);
+    for (let i = 0; i < n; i++) for (let g = 0; g < 2; g++) for (let c = 0; c < 4; c++) out[i * 8 + g * 4 + c] = raw[(g * n + i) * 4 + c];
     return out;
   }
 

@@ -1,0 +1,7 @@
+{
+  "watch": ["server.mjs", "models", "sounds"],
+  "ext": "mjs,glb,gltf,wav,mp3,ogg,oga,opus,flac,m4a,aac,webm",
+  "ignore": ["**/index.json", "node_modules"],
+  "delay": 500,
+  "exec": "npm run index && node server.mjs"
+}

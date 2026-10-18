@@ -2,7 +2,7 @@
 //
 // PIPELINE
 //   1. The tracer gives ENERGY data, not a waveform:
-//        omni        numBins x 4   fine-resolution energy per time bin, 4 octave bands
+//        omni        numBins x B   fine-resolution energy per time bin, B octave bands (data.bands)
 //        directional atlas of equirect tiles (coarse time slices) -> where the energy came from
 //   2. synthesizeSpeakerIR()  (pure JS, runs anywhere)
 //        Energy -> pressure by multiplying band-limited random noise with sqrt(energy envelope)
@@ -13,7 +13,7 @@
 //   3. RIRAuralizer (Web Audio)
 //        anechoic mono source -> bank gain -> K x ConvolverNode (one IR per speaker)
 //                             -> K x PannerNode (HRTF, placed at the speaker direction; shared by all banks)
-//                             -> master gain -> destination
+//                             -> master gain -> limiter -> destination
 //        A new IR gets a new bank; the switch cross-fades the bank INPUTS, so the old convolvers ring out
 //        their tail naturally and the new ones build up from silence (no output discontinuity -> no click).
 //
@@ -22,6 +22,9 @@
 // camera. Moving the listener or source still requires tracer.run() + setRIRFromTracer().
 //
 // Absolute level: the IR is scaled so the direct sound has amplitude 1/distance (1 at 1 m).
+// Headroom: rooms that are physically very loud (small rooms, focusing points) would clip, so an IR whose
+// energy norm exceeds opts.maxLevel is turned down to it (the level change rides on the cross-fade), and a
+// limiter on the output catches what is left. Below maxLevel, relative loudness is kept as is.
 
 const FOUR_PI = 4 * Math.PI;
 
@@ -66,7 +69,7 @@ function applyBiquad(x, [b0, b1, b2, a1, a2]) {
   }
 }
 
-/** Unit-variance random-sign noise, band-limited to octave band `band` (0..3). One channel per speaker. */
+/** Unit-variance random-sign noise, band-limited to octave band `band` (0..B-1). One channel per speaker. */
 function makeBandNoise(K, L, fs, crossovers, band, rng) {
   const WARM = 4096;                       // discard filter start-up transient
   const stages = [];
@@ -115,20 +118,20 @@ function computeTileGains(W, H, speakers, p) {
 
 /** sqrt of the fraction of each slice's band energy that goes to each speaker -> [slice][band][k]. */
 function computeSliceSqrtWeights(data, tileG, K) {
-  const { sliceWidth: W, sliceHeight: H, atlasCols: C, numSlices: S, directional: D } = data;
-  const Wa = W * C, out = new Float32Array(S * 4 * K), acc = new Float64Array(K);
+  const { sliceWidth: W, sliceHeight: H, atlasCols: C, numSlices: S, directional: D } = data, B = data.bands.length;
+  const Wa = W * C, out = new Float32Array(S * B * K), acc = new Float64Array(K);
   for (let s = 0; s < S; s++) {
     const col = s % C, row = Math.floor(s / C);
-    for (let b = 0; b < 4; b++) {
+    for (let b = 0; b < B; b++) {
       acc.fill(0); let tot = 0;
       for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-        const e = D[((row * H + j) * Wa + col * W + i) * 4 + b];
+        const e = D[((row * H + j) * Wa + col * W + i) * B + b];
         if (!(e > 0)) continue;
         tot += e;
         const g = (j * W + i) * K;
         for (let k = 0; k < K; k++) acc[k] += e * tileG[g + k];
       }
-      const base = (s * 4 + b) * K;
+      const base = (s * B + b) * K;
       for (let k = 0; k < K; k++) out[base + k] = tot > 0 ? Math.sqrt(acc[k] / tot) : Math.sqrt(1 / K);
     }
   }
@@ -138,21 +141,27 @@ function computeSliceSqrtWeights(data, tileG, K) {
 /* ------------------------------------------------------------------ IR synthesis */
 /**
  * @param data {
- *   omni: Float32Array(numBins*4), numBins, binDuration,
- *   directional: Float32Array(atlas RGBA), sliceWidth, sliceHeight, atlasCols, numSlices, sliceDuration,
- *   speedOfSound, airAbsorption:[4],
+ *   bands: [B centre frequencies, Hz],
+ *   omni: Float32Array(numBins*B), numBins, binDuration,
+ *   directional: Float32Array(atlas pixels * B), sliceWidth, sliceHeight, atlasCols, numSlices, sliceDuration,
+ *   speedOfSound, airAbsorption:[B],
  *   direct: { distance, direction:[x,y,z] } | null     (direction in the same frame as the atlas)
  * }
  * @returns { channels: Float32Array[K], sampleRate, length }
  */
 export function synthesizeSpeakerIR(data, speakers, opts = {}) {
-  const { sampleRate: fs, panExponent = 4, crossovers = [250, 1000, 4000], seed = 1 } = opts;
+  const B = data.bands.length;
+  // crossovers halfway (geometrically) between band centres; a band whose crossover would sit at or above
+  // Nyquist gets no lowpass
+  const nyq = 0.5 * opts.sampleRate;
+  const { sampleRate: fs, panExponent = 4, seed = 1,
+          crossovers = data.bands.slice(1).map((f, i) => Math.sqrt(f * data.bands[i])).filter((f) => f < 0.9 * nyq) } = opts;
   const K = speakers.length;
   const L = Math.ceil(data.numBins * data.binDuration * fs) + 2;
   const Ns = data.binDuration * fs;                         // samples per energy bin
   const rng = mulberry32(seed);
 
-  const noise = [0, 1, 2, 3].map((b) => makeBandNoise(K, L, fs, crossovers, b, rng));
+  const noise = data.bands.map((_, b) => makeBandNoise(K, L, fs, crossovers, Math.min(b, crossovers.length), rng));
   const tileG = computeTileGains(data.sliceWidth, data.sliceHeight, speakers, panExponent);
   const sw = computeSliceSqrtWeights(data, tileG, K);
   const uni = Math.sqrt(1 / K);                             // late field beyond the atlas: diffuse
@@ -168,13 +177,13 @@ export function synthesizeSpeakerIR(data, speakers, opts = {}) {
     if (Math.abs(bin - directBin) <= 1) continue;           // replaced by the analytic direct sound below
     const slice = Math.floor(t / data.sliceDuration);
     const hasDir = slice < data.numSlices;
-    for (let b = 0; b < 4; b++) {
-      const e = data.omni[bin * 4 + b];
+    for (let b = 0; b < B; b++) {
+      const e = data.omni[bin * B + b];
       if (!(e > 0)) continue;
       const amp = Math.sqrt(e * envScale);
       const nb = noise[b];
       for (let k = 0; k < K; k++) {
-        const w = hasDir ? sw[(slice * 4 + b) * K + k] : uni;
+        const w = hasDir ? sw[(slice * B + b) * K + k] : uni;
         out[k][n] += amp * w * nb.ch[k][n] * nb.inv[k];
       }
     }
@@ -183,8 +192,8 @@ export function synthesizeSpeakerIR(data, speakers, opts = {}) {
   if (data.direct) {                                        // clean, panned direct impulse (amplitude 1/d)
     const d = Math.max(data.direct.distance, 0.1);
     let air = 0;
-    for (let b = 0; b < 4; b++) air += Math.exp(-data.airAbsorption[b] * d);
-    const amp = Math.sqrt(air / 4) / d;
+    for (let b = 0; b < B; b++) air += Math.exp(-data.airAbsorption[b] * d);
+    const amp = Math.sqrt(air / B) / d;
     const w = new Float32Array(K);
     panWeights(data.direct.direction, speakers, panExponent, w);
     const delay = (data.direct.distance / data.speedOfSound) * fs;
@@ -206,6 +215,7 @@ export class RIRAuralizer {
    * @param opts.speakers      array of unit vectors, or a name from SPEAKER_LAYOUTS (default 'icosahedron')
    * @param opts.panExponent   directional lobe sharpness for distributing energy over speakers (default 4)
    * @param opts.crossfade     seconds to cross-fade from the old IR to a new one (default 0.4)
+   * @param opts.maxLevel      largest IR energy norm played unscaled; 1 = a direct sound at 1 m (default 2)
    */
   constructor(opts = {}) {
     this.ctx = opts.audioContext || new (window.AudioContext || window.webkitAudioContext)();
@@ -213,6 +223,7 @@ export class RIRAuralizer {
     this.speakers = typeof sp === 'string' ? SPEAKER_LAYOUTS[sp]() : sp;
     this.panExponent = opts.panExponent ?? 4;
     this.crossfade = opts.crossfade ?? 0.4;
+    this.maxLevel = opts.maxLevel ?? 2;
     this._fadeDone = Promise.resolve();
     this.worldFrame = false;
     this.anechoic = null;
@@ -227,7 +238,16 @@ export class RIRAuralizer {
 
     this.master = this.ctx.createGain();
     this.master.gain.value = 0.5;
-    this.master.connect(this.ctx.destination);
+
+    // safety limiter: near-brickwall above -3 dBFS (its built-in makeup gain keeps peaks just under 0 dBFS)
+    this.limiter = this.ctx.createDynamicsCompressor();
+    this.limiter.threshold.value = -3;
+    this.limiter.knee.value = 0;
+    this.limiter.ratio.value = 20;
+    this.limiter.attack.value = 0.002;
+    this.limiter.release.value = 0.15;
+    this.master.connect(this.limiter);
+    this.limiter.connect(this.ctx.destination);
 
     // one HRTF panner per virtual speaker; built once so a new IR never restarts the HRTF state
     this.panners = this.speakers.map((s) => {
@@ -259,12 +279,13 @@ export class RIRAuralizer {
   async setRIRFromTracer(tracer) {
     const o = tracer.opts, dp = tracer.directPath();
     return this.setRIR({
+      bands: o.bands,
       omni: tracer.readOmni(), numBins: o.numBins, binDuration: o.binDuration,
       directional: tracer.readDirectional(),
       sliceWidth: o.sliceWidth, sliceHeight: o.sliceHeight, atlasCols: o.atlasCols,
       numSlices: o.numSlices, sliceDuration: o.sliceDuration,
       speedOfSound: o.speedOfSound,
-      airAbsorption: [o.airAbsorption.x, o.airAbsorption.y, o.airAbsorption.z, o.airAbsorption.w],
+      airAbsorption: [...o.airAbsorption],
       direct: { distance: dp.distance, direction: [dp.direction.x, dp.direction.y, dp.direction.z] },
       worldFrame: !o.cameraRelative,
     });
@@ -281,21 +302,30 @@ export class RIRAuralizer {
       sampleRate: this.ctx.sampleRate, panExponent: this.panExponent,
     });
 
-    // one fade at a time: a value curve can't be interrupted portably (no cancelAndHoldAtTime in Firefox)
+    // one fade at a time: scheduled ramps can't be interrupted portably (no cancelAndHoldAtTime in Firefox)
     await this._fadeDone;
+    // headroom: energy norm over all speaker channels ~ output RMS for a white-noise input of RMS 1
+    let energy = 0;
+    for (const ch of ir.channels) for (let n = 0; n < ch.length; n++) energy += ch[n] * ch[n];
+    ir.norm = Math.sqrt(energy);
+    ir.level = Math.min(1, this.maxLevel / ir.norm);
+
     const bank = this._buildBank(ir);         // starts silent (input gain 0)
-    const old = this.bank, t = this.ctx.currentTime + 0.01, T = Math.max(this.crossfade, 0.01);
+    bank.level = ir.level;
+    // start a little ahead: the main thread may still be busy (GPU readback) when the events reach the audio thread
+    const old = this.bank, t = this.ctx.currentTime + 0.05, T = Math.max(this.crossfade, 0.01);
     if (!old) {
-      bank.gain.gain.value = 1;
+      bank.gain.gain.value = bank.level;
     } else {
-      // equal-power: the two reverbs are uncorrelated, so a linear fade would dip ~3 dB mid-way
-      const N = 64, fadeIn = new Float32Array(N), fadeOut = new Float32Array(N);
-      for (let i = 0; i < N; i++) {
-        const x = i / (N - 1) * Math.PI / 2;
-        fadeIn[i] = Math.sin(x); fadeOut[i] = Math.cos(x);
-      }
-      bank.gain.gain.setValueCurveAtTime(fadeIn, t, T);
-      old.gain.gain.setValueCurveAtTime(fadeOut, t, T);
+      // equal-power (the two reverbs are uncorrelated, so a linear fade would dip ~3 dB mid-way), built from
+      // linear ramps: Firefox steps through setValueCurveAtTime values, which clicks
+      const N = 32;
+      const fade = (param, shape) => {
+        param.setValueAtTime(shape(0), t);
+        for (let i = 1; i <= N; i++) param.linearRampToValueAtTime(shape(i / N * Math.PI / 2), t + T * i / N);
+      };
+      fade(bank.gain.gain, (x) => bank.level * Math.sin(x));
+      fade(old.gain.gain, (x) => old.level * Math.cos(x));
       this._fadeDone = new Promise((r) => setTimeout(r, (T + 0.05) * 1000));
       // the old convolvers are still ringing out what they received before the fade; free them once that's gone
       setTimeout(() => this._disposeBank(old), (T + ir.length / ir.sampleRate + 0.1) * 1000);

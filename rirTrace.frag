@@ -26,6 +26,7 @@ uniform sampler2D uState1;
 
 uniform int   uInit;            // 1 = emit new rays from the source, 0 = advance
 uniform int   uSeed;            // changes every pass
+uniform int   uRayTexSize;      // width of the ray-state textures (= one ray per texel)
 uniform vec3  uSource;
 uniform vec3  uListener;        // = camera world position (set by the JS driver)
 uniform mat3  uWorldToListener; // = inverse of the camera's world rotation
@@ -77,8 +78,9 @@ void main() {
     outHit    = vec4(0.0, 0.0, 0.0, -1.0);       // invalid by default
 
     ivec2 px = ivec2(gl_FragCoord.xy);
-    ivec2 rs = textureSize(uState0, 0);
-    uint  id = uint(px.y * rs.x + px.x);
+    // NOT textureSize(uState0): in the very first emit pass uState0 is a target that has never been rendered,
+    // which three.js replaces by a 1x1 placeholder -> ids collapse to px.x + px.y (only 127 distinct directions)
+    uint  id = uint(px.y * uRayTexSize + px.x);
     uint  rng = pcg(id ^ pcg(uint(uSeed) * 2654435761u + 12345u));
 
     // ------------------------------------------------ emit

@@ -1,0 +1,22 @@
+[
+  {
+    "file": "amphitheater.glb",
+    "name": "Amphitheater"
+  },
+  {
+    "file": "amphitheater-closed.glb",
+    "name": "Amphitheater (closed)"
+  },
+  {
+    "file": "anechoic.glb",
+    "name": "Anechoic chamber"
+  },
+  {
+    "file": "ellipse.glb",
+    "name": "Ellipse"
+  },
+  {
+    "file": "flat-chamber.glb",
+    "name": "Flat chamber"
+  }
+]
