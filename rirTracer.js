@@ -11,8 +11,13 @@
 //                        bands 0-3 in the bottom half of the texture, bands 4-7 stacked above
 //                        each pixel = total ENERGY arriving from that pixel's patch of the sphere
 //                        (divide by pixel solid angle for radiance; see pixelSolidAngle())
-//   tracer.omni        : (2 * numBins) x 1 fine-resolution energy histogram (sum over all directions),
-//                        bands 0-3 in x < numBins, bands 4-7 after
+//   tracer.omni        : fine-resolution energy histogram (sum over all directions), sized for maxDuration and
+//                        wrapped into rows of OMNI_W bins: bin i of band group g at (i % OMNI_W, g * omniRows +
+//                        floor(i / OMNI_W)). Only the first numBins bins (this run's window, see plan()) are filled.
+//
+// The window adapts to the room: before each trace, plan() casts a few CPU rays from the source to measure the mean
+// free path (and how many rays leave an open room), and from that plus the absorption works out when the slowest
+// band has decayed by minEnergyDb (Eyring-style). That sets the window (<= maxDuration) and the bounces traced.
 //
 // Usage:
 //   const frag = await (await fetch('./rirTrace.frag')).text();
@@ -71,14 +76,18 @@ void clipPoint() { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vEnergy = vec4(0.0); 
 // 1D fine time histogram (all directions summed)
 const OMNI_VERT = ACCUM_COMMON + /* glsl */`
 uniform float uBinDuration;
-uniform int   uNumBins;
+uniform int   uNumBins;                  // bins in this run's window (<= the target's capacity)
+uniform int   uOmniWidth;                // bins per row
+uniform int   uOmniRows;                 // rows per band group; group 1 sits above group 0
 void main() {
     vec4 h = fetchHit();
     float bin = floor(h.z / uSpeedOfSound / uBinDuration);
     if (h.w < 0.0 || bin >= float(uNumBins)) { clipPoint(); return; }
     vEnergy = bandEnergy(h);
     gl_PointSize = 1.0;
-    gl_Position = vec4((float(uGroup * uNumBins) + bin + 0.5) / float(2 * uNumBins) * 2.0 - 1.0, 0.0, 0.0, 1.0);
+    int i = int(bin);
+    vec2 p = vec2(float(i % uOmniWidth), float(uGroup * uOmniRows + i / uOmniWidth)) + 0.5;
+    gl_Position = vec4(p / vec2(float(uOmniWidth), float(2 * uOmniRows)) * 2.0 - 1.0, 0.0, 1.0);
 }
 `;
 
@@ -131,8 +140,8 @@ export class RIRTracer {
       rayTexSize: 128,            // 128x128 = 16384 rays per batch
       batches: 8,                 // total rays = batches * rayTexSize^2, unless `rays` is given
       rays: undefined,            // total rays, in whole rows of rayTexSize (the last batch may be partial)
-      maxBounces: 64,
-      minEnergyDb: 80,            // run() stops once the walls have absorbed this much of every band (see bounceCount)
+      maxBounces: 2000,           // upper limit on the bounces of one run (see plan(), setMaxBounces())
+      minEnergyDb: 80,            // the window ends once every band has decayed this much (see plan())
       speedOfSound: 343,
       listenerRadius: 0.15,
       scattering: 0.2,
@@ -140,19 +149,22 @@ export class RIRTracer {
       // energy attenuation of air, 1/m (ISO 9613-1, 20 °C, 50 % RH)
       airAbsorption: [1.0e-4, 3.0e-4, 6.3e-4, 1.1e-3, 2.3e-3, 6.8e-3, 2.4e-2, 8.6e-2],
       // fine omni histogram
-      numBins: 2048, binDuration: 0.0005,                         // ~1.02 s
+      maxDuration: 3, binDuration: 0.0005,                        // longest window (s), histogram bin (s)
       // directional atlas
       sliceWidth: 128, sliceHeight: 64,                           // equirect tile (2:1)
       numSlices: 32, sliceDuration: 0.004,                        // 32 x 4 ms = 128 ms
       atlasCols: 8,
     }, opts);
     o.atlasRows = Math.ceil(o.numSlices / o.atlasCols);
+    o.maxBins = Math.ceil(o.maxDuration / o.binDuration);
+    o.omniRows = Math.ceil(o.maxBins / OMNI_W);
+    o.numBins = o.maxBins;          // bins of the last run's window, set by run()
     if (o.rays === undefined) o.rays = o.batches * o.rayTexSize ** 2;
     o.bands = BANDS;                // fixed: the shaders accumulate exactly two groups of 4 bands
 
     this.read = floatTarget(o.rayTexSize, o.rayTexSize, 3);     // state0, state1, hit
     this.write = floatTarget(o.rayTexSize, o.rayTexSize, 3);
-    this.omniTarget = floatTarget(2 * o.numBins, 1);                                    // 2 band groups
+    this.omniTarget = floatTarget(OMNI_W, 2 * o.omniRows);                              // 2 band groups
     this.dirTarget = floatTarget(o.sliceWidth * o.atlasCols, 2 * o.sliceHeight * o.atlasRows);
     this.omni = this.omniTarget.texture;
     this.directional = this.dirTarget.texture;
@@ -173,7 +185,7 @@ export class RIRTracer {
         uListener: { value: this._listenerPos },
         uWorldToListener: { value: this._worldToListener },
         uListenerRadius: { value: o.listenerRadius },
-        uMaxPathLength: { value: o.speedOfSound * Math.max(o.numBins * o.binDuration, o.numSlices * o.sliceDuration) },
+        uMaxPathLength: { value: 0 },             // set by run() from plan()
         uScattering: { value: o.scattering },
       },
       depthTest: false, depthWrite: false, blending: THREE.NoBlending,
@@ -203,7 +215,10 @@ export class RIRTracer {
     };
     this.omniMat = new THREE.ShaderMaterial({
       ...additive, vertexShader: OMNI_VERT,
-      uniforms: { ...common, uBinDuration: { value: o.binDuration }, uNumBins: { value: o.numBins } },
+      uniforms: {
+        ...common, uBinDuration: { value: o.binDuration }, uNumBins: { value: o.numBins },
+        uOmniWidth: { value: OMNI_W }, uOmniRows: { value: o.omniRows },
+      },
     });
     this.dirMat = new THREE.ShaderMaterial({
       ...additive, vertexShader: DIR_VERT,
@@ -254,15 +269,37 @@ export class RIRTracer {
   /** Total rays = batches * rayTexSize^2. Takes effect on the next run(). */
   setBatches(batches) { this.setRayCount(batches * this.opts.rayTexSize ** 2); }
 
-  /** Passes run() traces: maxBounces, capped where even the least-absorbing band has lost minEnergyDb to the walls.
-   *  Pass k traces the segment after k reflections, whose energy is (1 - a)^k, so later passes add nothing audible. */
-  bounceCount() {
-    const o = this.opts, keep = Math.max(...o.absorption.map((a) => 1 - a));
-    const needed = keep >= 1 ? Infinity : Math.floor(-o.minEnergyDb / 10 * Math.LN10 / Math.log(keep)) + 1;
-    return Math.max(1, Math.min(o.maxBounces, needed));
+  /**
+   * Window and bounce budget for the next run(), from a CPU probe of the room (rays cast from the source through
+   * the BVH, reflecting diffusely): the mean free path, and the fraction of segments that leave an open room.
+   * Energy then decays per metre by  -ln(1 - a_b) / mfp  (walls)  - ln(1 - escape) / mfp  (open sky)  + air_b;
+   * the window ends where the slowest band has lost minEnergyDb (>= the directional window, <= maxDuration).
+   * Bounces cover that path at the mean free path with 50 % margin (shorter-than-average paths need more), but stop
+   * where the walls alone have taken minEnergyDb from every band.
+   * @returns { duration (s), numBins, bounces, mfp (m), escape (0..1) }
+   */
+  plan() {
+    const o = this.opts, c = o.speedOfSound, minDuration = o.numSlices * o.sliceDuration;
+    const { mfp, escape } = probeRoom(o.bvh, o.source);
+    const plan = (duration, bounces) => ({
+      duration, numBins: Math.min(o.maxBins, Math.ceil(duration / o.binDuration)), bounces, mfp, escape,
+    });
+    if (!(mfp < Infinity)) return plan(minDuration, 1);   // nothing to reflect off: direct segment only
+    const lnKeep = (k) => Math.log(Math.max(k, 1e-6));
+    let slowest = Infinity;                       // energy decay of the slowest band, nepers per metre
+    for (let b = 0; b < o.bands.length; b++) {
+      slowest = Math.min(slowest, -(lnKeep(1 - o.absorption[b]) + lnKeep(1 - escape)) / mfp + o.airAbsorption[b]);
+    }
+    const nepers = o.minEnergyDb / 10 * Math.LN10;
+    const duration = Math.min(o.maxDuration, Math.max(minDuration, nepers / slowest / c));
+    const keep = Math.max(...o.absorption.map((a) => 1 - a));
+    const wallBounces = keep >= 1 ? Infinity : Math.floor(nepers / -lnKeep(keep)) + 1;
+    const bounces = Math.min(o.maxBounces, wallBounces, Math.ceil(1.5 * c * duration / mfp) + 1);
+    return plan(duration, Math.max(1, bounces));
   }
 
-  /** Bounces traced per ray (upper limit, see bounceCount()). Takes effect on the next run(). */
+  /** Upper limit on the bounces plan() may pick: fewer means a faster trace, but rays may then stop before the
+   *  window ends (its tail comes out too weak). Takes effect on the next run(). */
   setMaxBounces(n) { this.opts.maxBounces = n; }
 
   /** Energy absorption per octave band (BANDS), 0..1, as [8]. Takes effect on the next run(). */
@@ -321,7 +358,8 @@ export class RIRTracer {
     }
   }
 
-  /** Runs the full simulation. Returns { directional, omni } textures and the number of bounces traced. */
+  /** Runs the full simulation over the window plan() picks. Returns { directional, omni } textures and the plan
+   *  ({ duration, numBins, bounces, mfp, escape }). */
   run() {
     const r = this.renderer;
     this.updateListener();
@@ -336,7 +374,10 @@ export class RIRTracer {
     for (const t of [this.omniTarget, this.dirTarget]) { r.setRenderTarget(t); r.clear(); }
 
     let seed = 1;
-    const o = this.opts, size = o.rayTexSize, bounces = this.bounceCount();
+    const o = this.opts, size = o.rayTexSize, plan = this.plan(), bounces = plan.bounces;
+    o.numBins = plan.numBins;
+    this.omniMat.uniforms.uNumBins.value = plan.numBins;
+    this.traceMat.uniforms.uMaxPathLength.value = o.speedOfSound * plan.duration;
     for (let b = 0; b < o.batches; b++) {
       // a partial last batch traces only its first `rows` rows (scissor) and splats only those rays (draw range)
       const rows = Math.min(size, (o.rays - b * size * size) / size), partial = rows < size;
@@ -355,7 +396,7 @@ export class RIRTracer {
     r.setRenderTarget(prevTarget);
     r.autoClear = prevAuto;
     r.setClearColor(prevColor, prevAlpha);
-    return { directional: this.directional, omni: this.omni, bounces };
+    return { directional: this.directional, omni: this.omni, ...plan };
   }
 
   /** Source distance and direction (in the same frame as the directional output), and whether the straight line
@@ -387,12 +428,17 @@ export class RIRTracer {
     return out;
   }
 
-  /** Read the fine omni histogram back to the CPU: Float32Array(numBins * 8), 8 bands per bin. */
+  /** Read the fine omni histogram of the last run's window back to the CPU: Float32Array(numBins * 8), 8 bands per
+   *  bin. Reads only the rows the window uses. */
   readOmni(out) {
-    const n = this.opts.numBins, raw = new Float32Array(2 * n * 4);
-    this.renderer.readRenderTargetPixels(this.omniTarget, 0, 0, 2 * n, 1, raw);
+    const { numBins: n, omniRows: R } = this.opts, rows = Math.ceil(n / OMNI_W);
+    const raw = [0, 1].map((g) => {
+      const px = new Float32Array(OMNI_W * rows * 4);
+      this.renderer.readRenderTargetPixels(this.omniTarget, 0, g * R, OMNI_W, rows, px);
+      return px;
+    });
     out = out || new Float32Array(n * 8);
-    for (let i = 0; i < n; i++) for (let g = 0; g < 2; g++) for (let c = 0; c < 4; c++) out[i * 8 + g * 4 + c] = raw[(g * n + i) * 4 + c];
+    for (let i = 0; i < n; i++) for (let g = 0; g < 2; g++) for (let c = 0; c < 4; c++) out[i * 8 + g * 4 + c] = raw[g][i * 4 + c];
     return out;
   }
 
@@ -412,19 +458,22 @@ export class RIRTracer {
 }
 
 /* ---------------------------------------------------------------- BVH */
-/** True if any triangle of bvh (from makeBVHTextures) crosses o + t d for 0 < t < length (CPU twin of traceBVH in
- *  rirTrace.frag; any hit will do, so no ordering). Ends are excluded by 1e-4 m: source / listener on a wall pass. */
-function segmentBlocked(bvh, o, d, length) {
-  const N = bvh.nodes.image.data, T = bvh.tris.image.data, EPS = 1e-6, tMin = 1e-4, tMax = length - 1e-4;
-  const ox = o.x, oy = o.y, oz = o.z, dx = d.x, dy = d.y, dz = d.z;
+/**
+ * CPU twin of traceBVH in rirTrace.frag: nearest triangle of bvh (from makeBVHTextures) along o + t d with
+ * tMin < t < tMax, as { t, n: [x, y, z] face normal }, or null. any = true returns the first hit found (shadow test).
+ */
+function castRay(bvh, o, d, tMin, tMax, any = false) {
+  const N = bvh.nodes.image.data, T = bvh.tris.image.data, EPS = 1e-6;
+  const [ox, oy, oz] = o, [dx, dy, dz] = d;
   const inv = (c) => (c >= 0 ? 1 : -1) / Math.max(Math.abs(c), 1e-20);   // as in the shader: no 0 * Infinity = NaN
   const ix = inv(dx), iy = inv(dy), iz = inv(dz);
+  let best = tMax, hit = -1;
   const boxHit = (n) => {
     const k = 8 * n;
     let t0 = (N[k] - ox) * ix, t1 = (N[k + 4] - ox) * ix, lo = Math.min(t0, t1), hi = Math.max(t0, t1);
     t0 = (N[k + 1] - oy) * iy; t1 = (N[k + 5] - oy) * iy; lo = Math.max(lo, Math.min(t0, t1)); hi = Math.min(hi, Math.max(t0, t1));
     t0 = (N[k + 2] - oz) * iz; t1 = (N[k + 6] - oz) * iz; lo = Math.max(lo, Math.min(t0, t1)); hi = Math.min(hi, Math.max(t0, t1));
-    return lo <= hi && hi > tMin && lo < tMax;
+    return lo <= hi && hi > tMin && lo < best;
   };
   const stack = [0];
   while (stack.length) {
@@ -437,21 +486,65 @@ function segmentBlocked(bvh, o, d, length) {
       const px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z, pz = dx * e2y - dy * e2x;
       const det = e1x * px + e1y * py + e1z * pz;
       if (Math.abs(det) < 1e-12) continue;
-      const inv = 1 / det, tx = ox - T[k], ty = oy - T[k + 1], tz = oz - T[k + 2];
-      const u = (tx * px + ty * py + tz * pz) * inv;
+      const rdet = 1 / det, tx = ox - T[k], ty = oy - T[k + 1], tz = oz - T[k + 2];
+      const u = (tx * px + ty * py + tz * pz) * rdet;
       if (u < -EPS || u > 1 + EPS) continue;
       const qx = ty * e1z - tz * e1y, qy = tz * e1x - tx * e1z, qz = tx * e1y - ty * e1x;
-      const v = (dx * qx + dy * qy + dz * qz) * inv;
+      const v = (dx * qx + dy * qy + dz * qz) * rdet;
       if (v < -EPS || u + v > 1 + EPS) continue;
-      const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
-      if (t > tMin && t < tMax) return true;
+      const t = (e2x * qx + e2y * qy + e2z * qz) * rdet;
+      if (t > tMin && t < best) {
+        best = t; hit = k;
+        if (any) return { t, n: [T[k + 3], T[k + 7], T[k + 11]] };
+      }
     }
   }
-  return false;
+  return hit < 0 ? null : { t: best, n: [T[hit + 3], T[hit + 7], T[hit + 11]] };
+}
+
+/** True if any triangle crosses o + t d for 0 < t < length. Ends are excluded by 1e-4 m: source / listener on a
+ *  wall pass. o, d: THREE.Vector3. */
+function segmentBlocked(bvh, o, d, length) {
+  return castRay(bvh, [o.x, o.y, o.z], [d.x, d.y, d.z], 1e-4, length - 1e-4, true) !== null;
+}
+
+/**
+ * Mean free path of the room around `source` and the fraction of segments that leave it (open rooms), from
+ * PROBE_RAYS rays reflecting diffusely (Lambert) for up to PROBE_BOUNCES bounces. Seeded, so the same room and
+ * source give the same answer (no window jitter between traces). mfp = Infinity if no ray hits anything.
+ */
+const PROBE_RAYS = 256, PROBE_BOUNCES = 24;
+function probeRoom(bvh, source) {
+  let seed = 12345;
+  const rnd = () => {                            // mulberry32
+    seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const sphere = () => {
+    const z = 1 - 2 * rnd(), phi = 2 * Math.PI * rnd(), r = Math.sqrt(Math.max(0, 1 - z * z));
+    return [r * Math.cos(phi), r * Math.sin(phi), z];
+  };
+  let length = 0, hits = 0, escapes = 0;
+  for (let r = 0; r < PROBE_RAYS; r++) {
+    let o = [source.x, source.y, source.z], d = sphere();
+    for (let b = 0; b < PROBE_BOUNCES; b++) {
+      const h = castRay(bvh, o, d, 1e-5, Infinity);
+      if (!h) { escapes++; break; }
+      length += h.t; hits++;
+      const n = d[0] * h.n[0] + d[1] * h.n[1] + d[2] * h.n[2] > 0 ? h.n.map((v) => -v) : h.n;   // two-sided
+      o = o.map((v, c) => v + d[c] * h.t + n[c] * 1e-4);
+      const s = sphere(), l = n.map((v, c) => v + s[c]), len = Math.hypot(...l) || 1;            // Lambert
+      d = l.map((v) => v / len);
+    }
+  }
+  return { mfp: hits ? length / hits : Infinity, escape: escapes / Math.max(1, hits + escapes) };
 }
 
 // Layout read by rirTrace.frag (see its header). Width = the minimum MAX_TEXTURE_SIZE of WebGL2.
 const BVH_TEX_W = 2048;
+const OMNI_W = 2048;        // omni histogram row width (bins), same reason
 const LEAF_SIZE = 4;        // stop splitting at this many triangles...
 const MAX_LEAF = 16;        // ...and keep splitting above this many even if the SAH prefers a leaf
 const MAX_DEPTH = 40;       // < STACK in rirTrace.frag

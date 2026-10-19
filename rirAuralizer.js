@@ -4,25 +4,19 @@
 //   1. The tracer gives ENERGY data, not a waveform:
 //        omni        numBins x B   fine-resolution energy per time bin, B octave bands (data.bands)
 //        directional atlas of equirect tiles (coarse time slices) -> where the energy came from
-//   2. synthesizeSpeakerIR()  (pure JS, runs anywhere)
+//   2. synthesizeAmbisonicIR()  (pure JS, runs anywhere)
 //        Energy -> pressure by multiplying band-limited random noise with sqrt(energy envelope)
-//        (the standard "stochastic RIR" construction). The energy is distributed over K virtual
-//        loudspeakers (default: icosahedron, 12) according to the directional atlas, with
-//        independent noise per speaker so the reverb tail is decorrelated.
-//        The direct sound is added analytically as a clean, correctly panned impulse.
-//   3. RIRAuralizer (Web Audio), two render modes:
-//        'speakers'  anechoic mono source -> bank gain -> K x ConvolverNode (one IR per speaker)
-//                    -> K x PannerNode (HRTF, at the speaker direction; shared by all banks) -> master
-//        'ambisonic' synthesizeAmbisonicIR() instead: 1st- or 3rd-order AmbiX RIR (4 / 16 channels);
-//                    anechoic mono source -> bank gain -> 4 / 16 x ConvolverNode -> merger -> Omnitone FOA / HOA
-//                    renderer (sound-field rotation for head tracking + binaural decoding) -> trim -> master
-//        master -> limiter -> destination
+//        (the standard "stochastic RIR" construction), encoded as a 1st- or 3rd-order AmbiX RIR (4 / 16 channels)
+//        with directions drawn from the directional atlas. The direct sound is added analytically as a clean
+//        impulse, encoded at its exact direction.
+//   3. RIRAuralizer (Web Audio):
+//        anechoic mono source -> bank gain -> 4 / 16 x ConvolverNode -> merger -> Omnitone FOA / HOA renderer
+//        (sound-field rotation for head tracking + binaural decoding) -> trim -> master -> limiter -> destination
 //        A new IR gets a new bank; the switch cross-fades the bank INPUTS, so the old convolvers ring out
 //        their tail naturally and the new ones build up from silence (no output discontinuity -> no click).
 //
-// HEAD TRACKING (no re-trace needed): trace with  cameraRelative:false  in RIRTracer. The speakers / the
-// ambisonic field are then in WORLD axes and setListenerFromCamera(camera) rotates the Web Audio listener and
-// the HOA field with the camera. Moving the listener or source still requires tracer.run() + setRIRFromTracer().
+// HEAD TRACKING (no re-trace needed): trace with  cameraRelative:false  in RIRTracer. The ambisonic field is then
+// in WORLD axes and setListenerFromCamera(camera) rotates it with the camera. Moving the listener or source still requires tracer.run() + setRIRFromTracer().
 //
 // Absolute level: the IR is scaled so the direct sound has amplitude 1/distance (1 at 1 m).
 // Headroom: rooms that are physically very loud (small rooms, focusing points) would clip, so an IR whose
@@ -31,24 +25,11 @@
 
 const FOUR_PI = 4 * Math.PI;
 
-/* ------------------------------------------------------------------ speaker layouts */
-const unit = (arr) => arr.map((v) => { const l = Math.hypot(v[0], v[1], v[2]); return [v[0] / l, v[1] / l, v[2] / l]; });
-
-export const SPEAKER_LAYOUTS = {
-  octahedron: () => unit([[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]),
-  cube: () => unit([-1, 1].flatMap((x) => [-1, 1].flatMap((y) => [-1, 1].map((z) => [x, y, z])))),
-  icosahedron: () => {
-    const t = (1 + Math.sqrt(5)) / 2;
-    return unit([[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t],
-                 [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]]);
-  },
-};
-
 /* ------------------------------------------------------------------ ambisonics (AmbiX: ACN order, SN3D) */
 export const AMBI_ORDERS = [1, 3];               // Omnitone: FOA renderer for 1, HOA renderer for 3
 export const AMBI_ORDER = 3, AMBI_CHANNELS = (AMBI_ORDER + 1) ** 2;   // highest order / channel count supported
 const ambiChannels = (order) => (order + 1) ** 2;
-// per order: output trim after Omnitone's decoder so that all render modes play at the same loudness, and the
+// per order: output trim after Omnitone's decoder so that both orders play at the same loudness, and the
 // signs f of the rotation matrix Omnitone needs (inverse(camera) * diag(f), measured)
 const AMBI_RENDER = {
   1: { trim: 10 ** (0.6 / 20), rotSigns: [1, 1, 1] },               // FOA renderer: plain inverse; +0.6 dB
@@ -100,149 +81,42 @@ function applyBiquad(x, [b0, b1, b2, a1, a2]) {
   }
 }
 
-/** Unit-variance random-sign noise, band-limited to octave band `band` (0..B-1). One channel per speaker. */
-function makeBandNoise(K, L, fs, crossovers, band, rng) {
+/** Random-sign noise of length L, band-limited to octave band `band` (0..B-1), scaled to unit variance. */
+function makeBandNoise(L, fs, crossovers, band, rng) {
   const WARM = 4096;                       // discard filter start-up transient
   const stages = [];
   if (band > 0) { const c = biquadCoefs('highpass', crossovers[band - 1], fs); stages.push(c, c); }
   if (band < crossovers.length) { const c = biquadCoefs('lowpass', crossovers[band], fs); stages.push(c, c); }
-  const ch = [], inv = new Float32Array(K);
-  for (let k = 0; k < K; k++) {
-    const x = new Float64Array(L + WARM);
-    for (let n = 0; n < x.length; n++) x[n] = rng() < 0.5 ? -1 : 1;
-    for (const c of stages) applyBiquad(x, c);
-    const y = new Float32Array(L);
-    let ss = 0;
-    for (let n = 0; n < L; n++) { y[n] = x[n + WARM]; ss += y[n] * y[n]; }
-    inv[k] = 1 / Math.sqrt(ss / L);        // normalise so band power == requested energy
-    ch.push(y);
-  }
-  return { ch, inv };
+  const x = new Float64Array(L + WARM);
+  for (let n = 0; n < x.length; n++) x[n] = rng() < 0.5 ? -1 : 1;
+  for (const c of stages) applyBiquad(x, c);
+  const y = new Float32Array(L);
+  let ss = 0;
+  for (let n = 0; n < L; n++) { y[n] = x[n + WARM]; ss += y[n] * y[n]; }
+  const inv = 1 / Math.sqrt(ss / L);       // normalise so band power == requested energy
+  for (let n = 0; n < L; n++) y[n] *= inv;
+  return y;
 }
 
-/* ------------------------------------------------------------------ directional weights */
+/* ------------------------------------------------------------------ directions */
 function equirectDir(u, v) {                // same convention as rirTrace.frag / rirTracer.js
   const lon = (u - 0.5) * 2 * Math.PI, lat = (v - 0.5) * Math.PI, cl = Math.cos(lat);
   return [cl * Math.sin(lon), Math.sin(lat), -cl * Math.cos(lon)];
 }
 
-/** Energy-normalised lobe panning: out[k] >= 0, sum(out) == 1. */
-function panWeights(dir, speakers, p, out) {
-  let sum = 0;
-  for (let k = 0; k < speakers.length; k++) {
-    const s = speakers[k];
-    const c = Math.max(0, dir[0] * s[0] + dir[1] * s[1] + dir[2] * s[2]);
-    out[k] = Math.pow(c, p); sum += out[k];
-  }
-  if (sum < 1e-12) { out.fill(1 / speakers.length); return; }
-  for (let k = 0; k < speakers.length; k++) out[k] /= sum;
-}
-
-function computeTileGains(W, H, speakers, p) {
-  const K = speakers.length, G = new Float32Array(W * H * K), tmp = new Float32Array(K);
-  for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-    panWeights(equirectDir((i + 0.5) / W, (j + 0.5) / H), speakers, p, tmp);
-    G.set(tmp, (j * W + i) * K);
-  }
-  return G;
-}
-
-/** sqrt of the fraction of each slice's band energy that goes to each speaker -> [slice][band][k]. */
-function computeSliceSqrtWeights(data, tileG, K) {
-  const { sliceWidth: W, sliceHeight: H, atlasCols: C, numSlices: S, directional: D } = data, B = data.bands.length;
-  const Wa = W * C, out = new Float32Array(S * B * K), acc = new Float64Array(K);
-  for (let s = 0; s < S; s++) {
-    const col = s % C, row = Math.floor(s / C);
-    for (let b = 0; b < B; b++) {
-      acc.fill(0); let tot = 0;
-      for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-        const e = D[((row * H + j) * Wa + col * W + i) * B + b];
-        if (!(e > 0)) continue;
-        tot += e;
-        const g = (j * W + i) * K;
-        for (let k = 0; k < K; k++) acc[k] += e * tileG[g + k];
-      }
-      const base = (s * B + b) * K;
-      for (let k = 0; k < K; k++) out[base + k] = tot > 0 ? Math.sqrt(acc[k] / tot) : Math.sqrt(1 / K);
-    }
-  }
-  return out;
-}
-
 /* ------------------------------------------------------------------ IR synthesis */
-/**
- * @param data {
- *   bands: [B centre frequencies, Hz],
- *   omni: Float32Array(numBins*B), numBins, binDuration,
- *   directional: Float32Array(atlas pixels * B), sliceWidth, sliceHeight, atlasCols, numSlices, sliceDuration,
- *   speedOfSound, airAbsorption:[B],
- *   direct: { distance, direction:[x,y,z] } | null     (direction in the same frame as the atlas)
- * }
- * @returns { channels: Float32Array[K], sampleRate, length }
- */
 // crossovers halfway (geometrically) between band centres; crossovers too close to Nyquist are dropped, so the
 // top bands then share the highest available band filter
 const bandCrossovers = (bands, fs) => bands.slice(1).map((f, i) => Math.sqrt(f * bands[i])).filter((f) => f < 0.45 * fs);
 
-export function synthesizeSpeakerIR(data, speakers, opts = {}) {
-  const B = data.bands.length;
-  const { sampleRate: fs, panExponent = 4, seed = 1, crossovers = bandCrossovers(data.bands, opts.sampleRate) } = opts;
-  const K = speakers.length;
-  const L = Math.ceil(data.numBins * data.binDuration * fs) + 2;
-  const Ns = data.binDuration * fs;                         // samples per energy bin
-  const rng = mulberry32(seed);
-
-  const noise = data.bands.map((_, b) => makeBandNoise(K, L, fs, crossovers, Math.min(b, crossovers.length), rng));
-  const tileG = computeTileGains(data.sliceWidth, data.sliceHeight, speakers, panExponent);
-  const sw = computeSliceSqrtWeights(data, tileG, K);
-  const uni = Math.sqrt(1 / K);                             // late field beyond the atlas: diffuse
-
-  const out = Array.from({ length: K }, () => new Float32Array(L));
-  const directBin = data.direct ? Math.floor(data.direct.distance / data.speedOfSound / data.binDuration) : -10;
-  const envScale = FOUR_PI / Ns;                            // energy per bin -> variance per sample (x4pi: 1/d scaling)
-
-  for (let n = 0; n < L; n++) {
-    const t = n / fs;
-    const bin = Math.floor(t / data.binDuration);
-    if (bin >= data.numBins) break;
-    if (Math.abs(bin - directBin) <= 1) continue;           // replaced by the analytic direct sound below
-    const slice = Math.floor(t / data.sliceDuration);
-    const hasDir = slice < data.numSlices;
-    for (let b = 0; b < B; b++) {
-      const e = data.omni[bin * B + b];
-      if (!(e > 0)) continue;
-      const amp = Math.sqrt(e * envScale);
-      const nb = noise[b];
-      for (let k = 0; k < K; k++) {
-        const w = hasDir ? sw[(slice * B + b) * K + k] : uni;
-        out[k][n] += amp * w * nb.ch[k][n] * nb.inv[k];
-      }
-    }
-  }
-
-  if (data.direct) {                                        // clean, panned direct impulse (amplitude 1/d)
-    const d = Math.max(data.direct.distance, 0.1);
-    let air = 0;
-    for (let b = 0; b < B; b++) air += Math.exp(-data.airAbsorption[b] * d);
-    const amp = Math.sqrt(air / B) / d;
-    const w = new Float32Array(K);
-    panWeights(data.direct.direction, speakers, panExponent, w);
-    const delay = (data.direct.distance / data.speedOfSound) * fs;
-    const i0 = Math.floor(delay), fr = delay - i0;
-    const norm = 1 / Math.hypot(1 - fr, fr);                 // keep impulse energy for any fractional delay
-    for (let k = 0; k < K; k++) {
-      const g = amp * Math.sqrt(w[k]) * norm;
-      if (i0 < L) out[k][i0] += g * (1 - fr);
-      if (i0 + 1 < L) out[k][i0 + 1] += g * fr;
-    }
-  }
-  return { channels: out, sampleRate: fs, length: L };
-}
-
 /**
- * Ambisonic RIR (AmbiX: ACN / SN3D, opts.order 1..AMBI_ORDER, default 3) from the same tracer data as
- * synthesizeSpeakerIR.
- * Per band, one noise signal carries the energy envelope (as in the speaker version); it is cut into grains
+ * Ambisonic RIR (AmbiX: ACN / SN3D, opts.order 1..AMBI_ORDER, default 3) from the tracer data:
+ *   data = { bands: [B centre frequencies, Hz],
+ *            omni: Float32Array(numBins * B), numBins, binDuration,
+ *            directional: Float32Array(atlas pixels * B), sliceWidth, sliceHeight, atlasCols, numSlices, sliceDuration,
+ *            speedOfSound, airAbsorption: [B],
+ *            direct: { distance, direction: [x, y, z] } | null }   (direction in the same frame as the atlas)
+ * Per band, one noise signal carries the energy envelope; it is cut into grains
  * (50 % overlap, ~2 periods of the band centre) and each grain is encoded from a direction drawn at random from
  * that time slice's directional energy in that band (uniform directions after the atlas window -> diffuse tail).
  * A grain's SH vector is split into the slice's mean m (shared by all its grains) and a random deviation Y - m:
@@ -250,7 +124,7 @@ export function synthesizeSpeakerIR(data, speakers, opts = {}) {
  * expected energy of every channel is right for both concentrated and diffuse slices, and W (channel 0, where
  * Y = m = 1) carries exactly the band energies. The direct sound is encoded exactly.
  * Directions in data are in the tracer's world (or listener) frame and are converted with worldToAmbi().
- * @returns { channels: Float32Array[(order + 1)^2], sampleRate, length, order, normChannels: [0] }
+ * @returns { channels: Float32Array[(order + 1)^2], sampleRate, length, order }
  */
 export function synthesizeAmbisonicIR(data, opts = {}) {
   const B = data.bands.length;
@@ -310,14 +184,14 @@ export function synthesizeAmbisonicIR(data, opts = {}) {
   const sig = new Float32Array(L);
   for (let b = 0; b < B; b++) {
     // band signal: noise x sqrt(energy envelope), direct-sound bins left out (added analytically below)
-    const nb = makeBandNoise(1, L, fs, crossovers, Math.min(b, crossovers.length), rng), noise = nb.ch[0], inv = nb.inv[0];
+    const noise = makeBandNoise(L, fs, crossovers, Math.min(b, crossovers.length), rng);
     sig.fill(0);
     for (let n = 0; n < L; n++) {
       const bin = Math.floor(n / Ns);
       if (bin >= data.numBins) break;
       if (Math.abs(bin - directBin) <= 1) continue;
       const e = data.omni[bin * B + b];
-      if (e > 0) sig[n] = Math.sqrt(e * envScale) * noise[n] * inv;
+      if (e > 0) sig[n] = Math.sqrt(e * envScale) * noise[n];
     }
     // grains: periodic Hann (amplitude-complementary) and its sqrt (power-complementary), hop G/2
     const G = 2 * Math.max(8, Math.min(1024, Math.round(fs / data.bands[b])));
@@ -349,7 +223,7 @@ export function synthesizeAmbisonicIR(data, opts = {}) {
       if (i0 + 1 < L) out[c][i0 + 1] += amp * norm * fr * Y[c];
     }
   }
-  return { channels: out, sampleRate: fs, length: L, order, normChannels: [0] };
+  return { channels: out, sampleRate: fs, length: L, order };
 }
 
 /** 32-bit float WAV (WAVE_FORMAT_EXTENSIBLE, no speaker mask) of an IR's channels, e.g. an AmbiX ARIR. */
@@ -374,32 +248,27 @@ export function encodeWav(ir) {
 export class RIRAuralizer {
   /**
    * @param opts.audioContext  existing AudioContext (optional)
-   * @param opts.speakers      array of unit vectors, or a name from SPEAKER_LAYOUTS (default 'icosahedron')
-   * @param opts.panExponent   directional lobe sharpness for distributing energy over speakers (default 4)
+   * @param opts.order         ambisonic order, 1 or 3 (default 1); setOrder() switches. Omnitone loads on first use.
    * @param opts.crossfade     seconds to cross-fade from the old IR to a new one (default 0.4)
    * @param opts.maxLevel      largest IR energy norm played unscaled; 1 = a direct sound at 1 m (default 2)
-   * Render mode: 'speakers' (default) or 'ambisonic' — call setMode() to switch (loads Omnitone)
    */
   constructor(opts = {}) {
     this.ctx = opts.audioContext || new (window.AudioContext || window.webkitAudioContext)();
-    const sp = opts.speakers || 'icosahedron';
-    this.speakers = typeof sp === 'string' ? SPEAKER_LAYOUTS[sp]() : sp;
-    this.panExponent = opts.panExponent ?? 4;
     this.crossfade = opts.crossfade ?? 0.4;
     this.maxLevel = opts.maxLevel ?? 2;
     this._fadeDone = Promise.resolve();
     this._queue = Promise.resolve();          // setRIR calls run one after the other
-    this.mode = 'speakers';
-    this.ambiOrder = AMBI_ORDER;
-    this.ambi = {};                           // order -> Omnitone FOA / HOA renderer, created by setMode()
-    this._lastData = null;                    // tracer data of the current IR (re-synthesised on mode change)
+    this.ambiOrder = opts.order ?? 1;
+    if (!AMBI_ORDERS.includes(this.ambiOrder)) throw new Error('unsupported ambisonic order ' + this.ambiOrder);
+    this.ambi = {};                           // order -> Omnitone FOA / HOA renderer, created on first use
+    this._lastData = null;                    // tracer data of the current IR (re-synthesised on order change)
     this._lastIR = null;
     this.worldFrame = false;
     this.anechoic = null;
     this.srcNode = null;
     this.bank = null;
 
-    // mono sum of the anechoic signal feeds every speaker convolver
+    // mono sum of the anechoic signal feeds every channel's convolver
     this.input = this.ctx.createGain();
     this.input.channelCount = 1;
     this.input.channelCountMode = 'explicit';
@@ -418,7 +287,7 @@ export class RIRAuralizer {
     this.master.connect(this.limiter);
     this.limiter.connect(this.ctx.destination);
 
-    // A/B switch, see setBypass(): the reverberant path (panners / ambisonic renderers) ends in wetOut; the dry
+    // A/B switch, see setBypass(): the reverberant path (ambisonic renderers) ends in wetOut; the dry
     // anechoic signal goes straight to master, loudness-matched to the current IR
     this.bypass = false;
     this.wetOut = this.ctx.createGain();
@@ -427,18 +296,6 @@ export class RIRAuralizer {
     this.dry.gain.value = 0;
     this.input.connect(this.dry);
     this.dry.connect(this.master);
-
-    // one HRTF panner per virtual speaker; built once so a new IR never restarts the HRTF state
-    this.panners = this.speakers.map((s) => {
-      const pan = this.ctx.createPanner();
-      pan.panningModel = 'HRTF';
-      pan.distanceModel = 'linear';
-      pan.rolloffFactor = 0;                  // no distance gain: level is already inside the IR
-      pan.refDistance = 1;
-      pan.positionX.value = s[0]; pan.positionY.value = s[1]; pan.positionZ.value = s[2];
-      pan.connect(this.wetOut);
-      return pan;
-    });
   }
 
   setGain(g) { this.master.gain.value = g; }
@@ -453,36 +310,38 @@ export class RIRAuralizer {
   _updateBypass() {
     // setTargetAtTime starts from wherever the gain is, so a switch mid-fade doesn't jump (no cancel needed)
     const t = this.ctx.currentTime, tc = 0.015;
-    // the binaural renderers come out ~2.5 dB below the IR's energy norm (measured, white noise, all modes)
+    // the binaural renderers come out ~2.5 dB below the IR's energy norm (measured, white noise, both orders)
     const dryLevel = 10 ** (-2.5 / 20) * (this.bank ? this.bank.level * this.bank.norm : 1);
     this.wetOut.gain.setTargetAtTime(this.bypass ? 0 : 1, t, tc);
     this.dry.gain.setTargetAtTime(this.bypass ? dryLevel : 0, t, tc);
   }
 
-  /** 'speakers' or 'ambisonic' (order 1 or 3). Re-synthesises the current IR in the new format (no re-trace)
-   *  and cross-fades. */
-  async setMode(mode, order = this.ambiOrder) {
-    if (mode !== 'speakers' && mode !== 'ambisonic') throw new Error('unknown render mode ' + mode);
-    if (mode === 'ambisonic') {
-      if (!AMBI_ORDERS.includes(order)) throw new Error('unsupported ambisonic order ' + order);
-      if (!this.ambi[order]) {
-        // loaded lazily: keeps the synthesis functions above usable without a browser / Omnitone
-        const { default: Omnitone } = await import('omnitone');
-        const r = order === 1 ? Omnitone.createFOARenderer(this.ctx)          // ACN channel map by default
-                              : Omnitone.createHOARenderer(this.ctx, { ambisonicOrder: order });
-        await r.initialize();                 // decodes Omnitone's built-in HRIRs for this order
-        const trim = this.ctx.createGain();
-        trim.gain.value = AMBI_RENDER[order].trim;
-        r.output.connect(trim);
-        trim.connect(this.wetOut);
-        this.ambi[order] = r;
-        this._rotateField(this._camElements);
-      }
-      this.ambiOrder = order;
-    }
-    this.mode = mode;
+  /** Ambisonic order 1 or 3. Loads that order's renderer, re-synthesises the current IR at it (no re-trace) and
+   *  cross-fades. */
+  async setOrder(order) {
+    if (!AMBI_ORDERS.includes(order)) throw new Error('unsupported ambisonic order ' + order);
+    await this._renderer(order);
+    this.ambiOrder = order;
     if (this._lastData) return this.setRIR(this._lastData);
     return null;
+  }
+
+  /** Omnitone FOA / HOA renderer for an order, created on first use. */
+  async _renderer(order) {
+    if (!this.ambi[order]) {
+      // loaded lazily: keeps the synthesis functions above usable without a browser / Omnitone
+      const { default: Omnitone } = await import('omnitone');
+      const r = order === 1 ? Omnitone.createFOARenderer(this.ctx)          // ACN channel map by default
+                            : Omnitone.createHOARenderer(this.ctx, { ambisonicOrder: order });
+      await r.initialize();                   // decodes Omnitone's built-in HRIRs for this order
+      const trim = this.ctx.createGain();
+      trim.gain.value = AMBI_RENDER[order].trim;
+      r.output.connect(trim);
+      trim.connect(this.wetOut);
+      this.ambi[order] = r;
+      this._rotateField(this._camElements);
+    }
+    return this.ambi[order];
   }
 
   /** Accepts URL string, File/Blob, ArrayBuffer or AudioBuffer. Use an ANECHOIC (dry) recording. */
@@ -514,7 +373,7 @@ export class RIRAuralizer {
     });
   }
 
-  /** data: see synthesizeSpeakerIR (+ optional worldFrame flag). Cross-fades from the previous IR. */
+  /** data: see synthesizeAmbisonicIR (+ optional worldFrame flag). Cross-fades from the previous IR. */
   setRIR(data) {
     this._lastData = data;
     const p = this._queue.then(() => this._setRIRNow(data));
@@ -524,20 +383,18 @@ export class RIRAuralizer {
 
   async _setRIRNow(data) {
     this.worldFrame = !!data.worldFrame;
-    if (!this.worldFrame) this._setListenerOrientation(0, 0, -1, 0, 1, 0);
+    await this._renderer(this.ambiOrder);
 
     // let the UI repaint before the (synchronous) synthesis
     await new Promise((r) => setTimeout(r, 0));
-    const opts = { sampleRate: this.ctx.sampleRate, panExponent: this.panExponent, order: this.ambiOrder };
-    const ir = this.mode === 'ambisonic' ? synthesizeAmbisonicIR(data, opts) : synthesizeSpeakerIR(data, this.speakers, opts);
-    ir.kind = this.mode;
+    const ir = synthesizeAmbisonicIR(data, { sampleRate: this.ctx.sampleRate, order: this.ambiOrder });
     this._lastIR = ir;
 
     // one fade at a time: scheduled ramps can't be interrupted portably (no cancelAndHoldAtTime in Firefox)
     await this._fadeDone;
-    // headroom: energy norm (all speaker channels, or W of the ambisonic IR) ~ output RMS for white noise of RMS 1
+    // headroom: energy norm of W (channel 0) ~ output RMS for white noise of RMS 1
     let energy = 0;
-    for (const c of ir.normChannels || ir.channels.keys()) for (const v of ir.channels[c]) energy += v * v;
+    for (const v of ir.channels[0]) energy += v * v;
     ir.norm = Math.sqrt(energy);
     ir.level = Math.min(1, this.maxLevel / ir.norm);
 
@@ -571,7 +428,7 @@ export class RIRAuralizer {
     const ctx = this.ctx;
     const gain = ctx.createGain();
     gain.gain.value = 0;                      // silent BEFORE it is connected
-    const merger = ir.kind === 'ambisonic' ? ctx.createChannelMerger(ir.channels.length) : null;
+    const merger = ctx.createChannelMerger(ir.channels.length);
     const convs = ir.channels.map((ch, k) => {
       const buf = ctx.createBuffer(1, ir.length, ir.sampleRate);
       buf.copyToChannel(ch, 0);
@@ -581,11 +438,10 @@ export class RIRAuralizer {
       conv.buffer = buf;
 
       gain.connect(conv);
-      if (merger) conv.connect(merger, 0, k);  // ACN channel k
-      else conv.connect(this.panners[k]);
+      conv.connect(merger, 0, k);             // ACN channel k
       return conv;
     });
-    if (merger) merger.connect(this.ambi[ir.order].input);
+    merger.connect(this.ambi[ir.order].input);
     this.input.connect(gain);
     return { gain, convs, merger };
   }
@@ -594,17 +450,14 @@ export class RIRAuralizer {
     try { this.input.disconnect(bank.gain); } catch (e) { /* already gone */ }
     bank.gain.disconnect();
     bank.convs.forEach((c) => c.disconnect());
-    if (bank.merger) bank.merger.disconnect();
+    bank.merger.disconnect();
   }
 
-  /** The current IR as an AmbiX (ACN / SN3D) ARIR in a float WAV, at the current ambisonic order (3rd order when
-   *  rendering 'speakers', synthesised for export). Absolute level (direct sound = 1/distance), no headroom scaling.
-   *  @returns { wav: ArrayBuffer, order } */
+  /** The current IR as an AmbiX (ACN / SN3D) ARIR in a float WAV, at the current ambisonic order. Absolute level
+   *  (direct sound = 1/distance), no headroom scaling.  @returns { wav: ArrayBuffer, order } */
   exportAmbisonicWav() {
-    if (!this._lastData) throw new Error('no RIR yet');
-    const ir = this._lastIR?.kind === 'ambisonic' ? this._lastIR
-      : synthesizeAmbisonicIR(this._lastData, { sampleRate: this.ctx.sampleRate, order: AMBI_ORDER });
-    return { wav: encodeWav(ir), order: ir.order };
+    if (!this._lastIR) throw new Error('no RIR yet');
+    return { wav: encodeWav(this._lastIR), order: this._lastIR.order };
   }
 
   async play({ loop = true, offset = 0 } = {}) {
@@ -623,13 +476,11 @@ export class RIRAuralizer {
     if (this.srcNode) { try { this.srcNode.stop(); } catch (e) { /* not started */ } this.srcNode.disconnect(); this.srcNode = null; }
   }
 
-  /** World-frame IRs only: rotate the Web Audio listener and the ambisonic field with a Three.js camera (every
-   *  frame). */
+  /** World-frame IRs only: rotate the ambisonic field with a Three.js camera (every frame). */
   setListenerFromCamera(camera) {
     if (!this.worldFrame) { this._camElements = null; this._rotateField(null); return; }
     if (camera.updateWorldMatrix) camera.updateWorldMatrix(true, false);
     const e = camera.matrixWorld.elements;     // columns: X (0-2), Y (4-6), Z (8-10); camera looks down -Z
-    this._setListenerOrientation(-e[8], -e[9], -e[10], e[4], e[5], e[6]);
     this._camElements = e;
     this._rotateField(e);
   }
@@ -644,16 +495,6 @@ export class RIRAuralizer {
       for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) m[j * 4 + i] = (e ? e[i * 4 + j] : +(i === j)) * f[j];
       m[15] = 1;
       r.setRotationMatrix4(m);
-    }
-  }
-
-  _setListenerOrientation(fx, fy, fz, ux, uy, uz) {
-    const l = this.ctx.listener;
-    if (l.forwardX) {
-      l.forwardX.value = fx; l.forwardY.value = fy; l.forwardZ.value = fz;
-      l.upX.value = ux; l.upY.value = uy; l.upZ.value = uz;
-    } else {
-      l.setOrientation(fx, fy, fz, ux, uy, uz);
     }
   }
 }

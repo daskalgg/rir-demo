@@ -136,7 +136,7 @@ for (const b of document.querySelectorAll('#pad [data-dir]')) {
 }
 
 /* ---------------------------------------------------------------- tracer + auralizer */
-const aur = new RIRAuralizer({ speakers: 'cube', crossfade: 0.4 });
+const aur = new RIRAuralizer({ crossfade: 0.4 });
 let tracer = null, traceFrag = null;            // the tracer is created by the first loadRoom()
 
 async function init() {
@@ -184,7 +184,7 @@ async function loadRoom(src, name) {           // src: URL string or File
       bvh, camera,
       source: sourcePos,
       cameraRelative: false,          // directions in WORLD axes -> head tracking via AudioListener, no re-trace
-      rayTexSize: RAY_TEX, rays: rayCount(), maxBounces: +$('bounces').value,
+      rayTexSize: RAY_TEX, rays: rayCount(), maxBounces: +$('bounces').value,   // upper limit, see RIRTracer.plan()
       absorption: DEFAULT_MATERIAL.absorption, scattering: DEFAULT_MATERIAL.scattering,
       airAbsorption: airCoefficients(),
     });
@@ -367,24 +367,22 @@ async function trace() {
 $('trace').onclick = () => trace();
 $('auto').onchange = () => requestTrace(0);
 
-// render mode: switching re-synthesises the current RIR in the other format (no re-trace) and cross-fades
+// ambisonic order: switching re-synthesises the current RIR at the other order (no re-trace) and cross-fades
 async function applyRenderMode() {
-  const [mode, order] = $('render').value.split(':');   // "speakers" | "ambisonic:<order>"
   $('render').disabled = true;
   try {
-    await aur.setMode(mode, order ? +order : undefined);
+    await aur.setOrder(+$('render').value);
     status(`rendering: ${$('render').selectedOptions[0].textContent}`);
   } catch (err) {
     console.error(err);
-    if (mode !== 'speakers') { $('render').value = 'speakers'; await aur.setMode('speakers'); }
-    status('ambisonic renderer unavailable (' + (err.message || err) + ') — using virtual speakers');
+    status('ambisonic renderer unavailable: ' + (err.message || err));
   }
   $('render').disabled = false;
 }
 $('render').onchange = applyRenderMode;
 
 $('export').onclick = () => {
-  const { wav, order } = aur.exportAmbisonicWav();   // 3rd order, synthesised on the spot, in 'speakers' mode
+  const { wav, order } = aur.exportAmbisonicWav();   // at the current order
   const room = ($('roomSelect').selectedOptions[0]?.textContent || 'room').replace(/[^\w.-]+/g, '_');
   const url = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
   const a = Object.assign(document.createElement('a'), { href: url, download: `${room}-ARIR-${order}OA-AmbiX-${aur.ctx.sampleRate}Hz.wav` });

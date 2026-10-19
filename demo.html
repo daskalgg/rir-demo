@@ -96,7 +96,7 @@
             <button id="trace" disabled>1. Trace RIR from here</button>
             <button id="play" disabled>2. Play / stop</button>
             <label class="switch" title="play the sound without the room (no RIR), at the same loudness — for A/B comparison"><input type="checkbox" id="bypass"> Anechoic (bypass RIR)</label>
-            <button id="export" disabled title="ambisonic RIR at the selected order (3rd order in speaker mode), AmbiX (ACN / SN3D), float WAV">Export ARIR (AmbiX .wav)</button><br>
+            <button id="export" disabled title="ambisonic RIR at the selected order, AmbiX (ACN / SN3D), float WAV">Export ARIR (AmbiX .wav)</button><br>
             <div id="more">
             <small class="hint"><span class="mouse-only">Drag to look around · W A S D walk the listener, Q / E down / up · arrow keys move the source (orange), Page Up / Down or Shift + ↑ / ↓ raise / lower it</span><span class="touch-only">Drag to look around · hold the arrows (bottom left) to walk the listener or move the source (orange); ⤒ / ⤓ move it up / down</span></small>
             <label>Sound: <select id="soundSelect"><option value="test">Test signal (claps + tones)</option></select></label>
@@ -108,14 +108,13 @@
                 <div id="settings">
                     <h3>Simulation</h3>
                     <label><span>Rays</span><input type="range" id="rays" min="0" max="65" step="1" value="2"><output id="raysOut"></output></label>
-                    <label><span>Bounces</span><input type="range" id="bounces" min="1" max="256" step="1" value="40"><output id="bouncesOut"></output></label>
+                    <label title="upper limit: the bounces actually traced follow the room and its material (fewer when the sound dies out sooner)"><span>Max bounces</span><input type="range" id="bounces" min="1" max="1000" step="1" value="256"><output id="bouncesOut"></output></label>
                     <label title="energy lost to the air itself, mostly above 2 kHz (ISO 9613-1, sea-level pressure)"><input type="checkbox" id="air" checked><span>Air absorption</span></label>
                     <label><span>Air temp</span><input type="range" id="airTemp" min="-10" max="40" step="1" value="20"><output id="airTempOut"></output></label>
                     <label><span>Humidity</span><input type="range" id="airRH" min="10" max="100" step="5" value="50"><output id="airRHOut"></output></label>
                     <label><span>Rendering</span><select id="render">
-                        <option value="ambisonic:3">Ambisonics, 3rd order → binaural (Omnitone)</option>
-                        <option value="ambisonic:1" selected>Ambisonics, 1st order → binaural (Omnitone)</option>
-                        <option value="speakers">8 virtual speakers × HRTF panners</option>
+                        <option value="3">Ambisonics, 3rd order → binaural (Omnitone)</option>
+                        <option value="1" selected>Ambisonics, 1st order → binaural (Omnitone)</option>
                     </select></label>
                     <label><span>Material</span><select id="material"></select></label>
                     <div id="coefs"></div>   <!-- band headers + inputs are built by demo.js from BANDS -->
