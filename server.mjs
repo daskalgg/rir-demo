@@ -1,14 +1,17 @@
 // Minimal static server for the demo (no dependencies). Serves this folder, including node_modules/three.
 //
-//   npm start            -> http://localhost:8080/        (PORT=3000 npm start for another port)
+//   npm start            -> http://0.0.0.0:8080/, reachable from other devices on the network
+//                           (PORT=3000 / HOST=127.0.0.1 npm start for another port / this machine only)
 //   npm run dev          -> same, via nodemon (see nodemon.json)
 import http from 'node:http';
+import { networkInterfaces } from 'node:os';
 import { createReadStream, statSync } from 'node:fs';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
 const PORT = +(process.env.PORT || 8080);
+const HOST = process.env.HOST || '0.0.0.0';
 const TYPES = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8', '.frag': 'text/plain; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -34,4 +37,11 @@ http.createServer((req, res) => {
   });
   if (req.method === 'HEAD') { res.end(); return; }
   createReadStream(file).pipe(res);
-}).listen(PORT, () => console.log(`RIR demo: http://localhost:${PORT}/`));
+}).listen(PORT, HOST, () => {
+  console.log(`RIR demo: http://${HOST}:${PORT}/`);
+  if (HOST === '0.0.0.0') {                     // the addresses other devices can use
+    for (const a of Object.values(networkInterfaces()).flat()) {
+      if (a.family === 'IPv4' && !a.internal) console.log(`          http://${a.address}:${PORT}/`);
+    }
+  }
+});
