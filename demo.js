@@ -6,12 +6,16 @@ import { RIRAuralizer } from './rirAuralizer.js';
 const $ = (id) => document.getElementById(id);
 const status = (s) => { $('status').textContent = s; };
 
-/* ---------------------------------------------------------------- room materials */
-// absorption per octave band (BANDS: 125 Hz .. 16 kHz) and scattering, applied to every surface; values follow
-// the usual 125 Hz - 4 kHz tables, with 8 / 16 kHz continuing each material's trend (tables rarely go that high)
 const DEFAULT_MATERIAL = { absorption: [0.20, 0.22, 0.25, 0.27, 0.30, 0.33, 0.35, 0.37], scattering: 0.2 };
 const MATERIALS = [
   //                                                                 125   250   500   1k    2k    4k    8k    16k
+  // uniform test materials: the same absorption in every band
+  { id: 'abs0',     label: 'Uniform, no absorption (0)',   absorption: [0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00], scattering: 0.20 },
+  { id: 'abs20',    label: 'Uniform, absorption 0.2',      absorption: [0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20], scattering: 0.20 },
+  { id: 'abs50',    label: 'Uniform, absorption 0.5',      absorption: [0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50], scattering: 0.20 },
+  { id: 'abs70',    label: 'Uniform, absorption 0.7',      absorption: [0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70], scattering: 0.20 },
+  { id: 'abs100',   label: 'Uniform, full absorption (1)', absorption: [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00], scattering: 0.20 },
+  // real materials
   { id: 'concrete', label: 'Concrete (smooth)',            absorption: [0.01, 0.01, 0.02, 0.02, 0.02, 0.03, 0.04, 0.05], scattering: 0.05 },
   { id: 'brick',    label: 'Brick (unglazed)',             absorption: [0.03, 0.03, 0.03, 0.04, 0.05, 0.07, 0.08, 0.09], scattering: 0.10 },
   { id: 'marble',   label: 'Marble / glazed tile',         absorption: [0.01, 0.01, 0.01, 0.01, 0.02, 0.02, 0.03, 0.03], scattering: 0.05 },
@@ -167,6 +171,17 @@ async function init() {
 
 /* ---------------------------------------------------------------- glTF rooms */
 let loadToken = 0;
+// back to the room's start positions (markers or defaults), the listener facing the source
+const startPos = { source: new THREE.Vector3(), listener: new THREE.Vector3() };
+function resetPositions() {
+  sourcePos.copy(startPos.source);              // uSource holds this vector, so the tracer sees the change
+  sourceMesh.position.copy(sourcePos);
+  camera.position.copy(startPos.listener);
+  yaw = Math.atan2(camera.position.x - sourcePos.x, camera.position.z - sourcePos.z);   // face the source
+  pitch = 0;
+}
+$('reset').addEventListener('click', () => { if (roomBox.isEmpty()) return; resetPositions(); requestTrace(0); });
+
 async function loadRoom(src, name) {           // src: URL string or File
   const token = ++loadToken;
   status('loading ' + name + '…');
@@ -215,11 +230,9 @@ async function loadRoom(src, name) {           // src: URL string or File
     gltf.scene.traverse((o) => { if (!found && o.name.toLowerCase() === name) found = o; });
     return found && found.getWorldPosition(new THREE.Vector3());
   };
-  sourcePos.copy(marker('source') || rel(0.75, 0.47, 0.7));   // uSource holds this vector, so the tracer sees the change
-  sourceMesh.position.copy(sourcePos);
-  camera.position.copy(marker('listener') || rel(0.25, 0.53, 0.3));
-  yaw = Math.atan2(camera.position.x - sourcePos.x, camera.position.z - sourcePos.z);   // face the source
-  pitch = 0;
+  startPos.source.copy(marker('source') || rel(0.75, 0.47, 0.7));
+  startPos.listener.copy(marker('listener') || rel(0.25, 0.53, 0.3));
+  resetPositions();
   camera.far = Math.max(50, 2 * roomBox.getSize(new THREE.Vector3()).length());
   camera.updateProjectionMatrix();
 
@@ -323,9 +336,6 @@ $('room').onchange = (e) => {
   selectRoom();
 };
 
-/* ---------------------------------------------------------------- (re)tracing */
-// Changes are debounced, and at most one trace runs at a time: a change during a trace queues exactly one
-// more, which picks up the latest state. The auralizer cross-fades to each new RIR.
 let tracing = false, traceQueued = false, traceTimer = 0;
 
 function requestTrace(delay = 250) {
@@ -349,11 +359,7 @@ async function trace() {
     drawEchogram(omni, tracer.opts.numBins);
     const direct = tracer.directPath();
     setDebugData(directional, direct);
-    status(`RIR ready (${((performance.now() - t0) / 1000).toFixed(1)} s)` //+
-      // (direct.visible ? '' : ' · no line of sight: direct sound blocked') +
-      // (bounces < tracer.opts.maxBounces ? ` · ${bounces} bounces, later ones are below −${tracer.opts.minEnergyDb} dB` : '') +
-           // (ir.level < 1 ? ` · turned down ${(-20 * Math.log10(ir.level)).toFixed(1)} dB to avoid clipping` : '')
-          );
+    status("RIR ready");
     $('play').disabled = false;
     $('export').disabled = false;
   } catch (e) {

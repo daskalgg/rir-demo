@@ -102,7 +102,8 @@
             <label>Sound: <select id="soundSelect"><option value="test">Test signal (claps + tones)</option></select></label>
             <label>or open an audio file: <input type="file" id="file" accept="audio/*"></label><br>
             <label>Room: <select id="roomSelect" disabled></select></label>
-            <label>or open a glTF file: <input type="file" id="room" accept=".glb,.gltf" disabled></label><br>
+            <label>or open a glTF file: <input type="file" id="room" accept=".glb,.gltf" disabled></label>
+            <button id="reset" title="move the source and listener back to where the room starts them">Reset positions</button><br>
             <canvas id="echo" width="520" height="120"></canvas>
             <small>Echogram of the 8 octave bands, 125 Hz – 16 kHz (low → high: red → violet).</small>
                 <div id="settings">

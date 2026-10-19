@@ -12,16 +12,16 @@
     "name": "Anechoic chamber"
   },
   {
-    "file": "room.glb",
-    "name": "Complex room"
-  },
-  {
     "file": "cube-10m.glb",
     "name": "Cube 10 m"
   },
   {
     "file": "cube-20m.glb",
     "name": "Cube 20 m"
+  },
+  {
+    "file": "double-room.glb",
+    "name": "Double Room"
   },
   {
     "file": "ellipse.glb",
@@ -34,9 +34,5 @@
   {
     "file": "flat-chamber.glb",
     "name": "Flat chamber"
-  },
-  {
-    "file": "maze.glb",
-    "name": "Maze"
   }
 ]
