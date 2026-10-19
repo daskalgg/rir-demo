@@ -1,13 +1,12 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { RIRTracer, makeSurfelTextures, BANDS, airAbsorption } from './rirTracer.js';
+import { RIRTracer, makeBVHTextures, BANDS, airAbsorption } from './rirTracer.js';
 import { RIRAuralizer } from './rirAuralizer.js';
 
 const $ = (id) => document.getElementById(id);
 const status = (s) => { $('status').textContent = s; };
 
 /* ---------------------------------------------------------------- room materials */
-const TEX = 64;                                  // 64x64 = 4096 surfels
 // absorption per octave band (BANDS: 125 Hz .. 16 kHz) and scattering, applied to every surface; values follow
 // the usual 125 Hz - 4 kHz tables, with 8 / 16 kHz continuing each material's trend (tables rarely go that high)
 const DEFAULT_MATERIAL = { absorption: [0.20, 0.22, 0.25, 0.27, 0.30, 0.33, 0.35, 0.37], scattering: 0.2 };
@@ -29,47 +28,21 @@ const BAND_COLORS = BANDS.map((_, b) => `hsl(${(b / (BANDS.length - 1)) * 270}, 
 let roomMaterial = DEFAULT_MATERIAL;            // the loaded room's own material (glTF scene extras), see loadRoom
 
 /* ---------------------------------------------------------------- room (arbitrary triangle mesh, e.g. glTF) */
-function meshTriangles(root) {                  // world-space triangles of every mesh under root
+function meshTriangles(root) {                  // world-space triangles of every mesh under root, 9 floats each
   root.updateMatrixWorld(true);
-  const tris = [];
+  const out = [], v = new THREE.Vector3();
   root.traverse((m) => {
     if (!m.isMesh || !m.geometry.attributes.position) return;
     const pos = m.geometry.attributes.position, index = m.geometry.index;
     const n = index ? index.count : pos.count;
-    const vert = (i) => new THREE.Vector3().fromBufferAttribute(pos, index ? index.getX(i) : i).applyMatrix4(m.matrixWorld);
     for (let i = 0; i + 2 < n; i += 3) {
-      const a = vert(i), b = vert(i + 1), c = vert(i + 2);
-      const nrm = new THREE.Vector3().crossVectors(b.clone().sub(a), c.clone().sub(a));
-      const area = 0.5 * nrm.length();
-      if (area < 1e-9) continue;               // degenerate
-      tris.push({ a, b, c, n: nrm.normalize(), area });
-    }
-  });
-  return tris;
-}
-
-function meshSurfels(tris, maxCount) {
-  const area = tris.reduce((s, t) => s + t.area, 0);
-  const step = area / maxCount;                 // surface area per surfel
-  const positions = new Float32Array(maxCount * 3).fill(1e6);
-  const normals = new Float32Array(maxCount * 3);
-  const G = 1.32471795724474602596, a1 = 1 / G, a2 = 1 / (G * G);   // R2 low-discrepancy sequence
-  let idx = 0, next = Math.random() * step, cum = 0;
-  for (const t of tris) {                       // systematic sampling: surfel count proportional to area
-    cum += t.area;
-    const r0 = Math.random(), r1 = Math.random();
-    for (let j = 0; next < cum && idx < maxCount; j++, idx++, next += step) {
-      let u = (r0 + j * a1) % 1, v = (r1 + j * a2) % 1;
-      if (u + v > 1) { u = 1 - u; v = 1 - v; } // fold the unit square onto the triangle
-      for (let c = 0; c < 3; c++) {
-        const k = 'xyz'[c];
-        positions[idx * 3 + c] = t.a[k] + u * (t.b[k] - t.a[k]) + v * (t.c[k] - t.a[k]);
-        normals[idx * 3 + c] = t.n[k];
+      for (let k = 0; k < 3; k++) {
+        v.fromBufferAttribute(pos, index ? index.getX(i + k) : i + k).applyMatrix4(m.matrixWorld);
+        out.push(v.x, v.y, v.z);
       }
     }
-  }
-  // samples are irregular, so the discs need generous overlap to keep rays from leaking through gaps
-  return { positions, normals, surfelRadius: 1.0 * Math.sqrt(step), count: idx };
+  });
+  return new Float32Array(out);                 // degenerate triangles are dropped by makeBVHTextures
 }
 
 /* ---------------------------------------------------------------- three.js scene (visual feedback only) */
@@ -202,16 +175,14 @@ async function loadRoom(src, name) {           // src: URL string or File
     ? await loader.loadAsync(src)
     : await loader.parseAsync(await src.arrayBuffer(), '');   // .glb or .gltf with embedded buffers
   if (token !== loadToken) return;              // another room was picked meanwhile
-  const tris = meshTriangles(gltf.scene);
-  if (!tris.length) throw new Error(name + ' contains no triangles');
-  const room = meshSurfels(tris, TEX * TEX);
+  const t0 = performance.now();
+  const bvh = makeBVHTextures(meshTriangles(gltf.scene));   // throws on a room without triangles
+  const buildMs = performance.now() - t0;
 
-  const [tex1, tex2] = makeSurfelTextures(room.positions, room.normals, TEX, TEX);
   if (!tracer) {
     tracer = new RIRTracer(renderer, traceFrag, {
-      tex1, tex2, camera,
+      bvh, camera,
       source: sourcePos,
-      surfelRadius: room.surfelRadius,
       cameraRelative: false,          // directions in WORLD axes -> head tracking via AudioListener, no re-trace
       rayTexSize: RAY_TEX, rays: rayCount(), maxBounces: +$('bounces').value,
       absorption: DEFAULT_MATERIAL.absorption, scattering: DEFAULT_MATERIAL.scattering,
@@ -219,10 +190,7 @@ async function loadRoom(src, name) {           // src: URL string or File
     });
     $('trace').disabled = false;
   } else {
-    const u = tracer.traceMat.uniforms;
-    u.uTex1.value.dispose(); u.uTex2.value.dispose();
-    [u.uTex1.value, u.uTex2.value] = [tex1, tex2];
-    u.uSurfelRadius.value = room.surfelRadius;
+    tracer.setGeometry(bvh);
   }
   // optional room material from the glTF scene's extras: { "absorption": [one per band in BANDS], "scattering": s }
   const { absorption: abs, scattering: sc } = gltf.scene.userData;
@@ -255,14 +223,14 @@ async function loadRoom(src, name) {           // src: URL string or File
   camera.far = Math.max(50, 2 * roomBox.getSize(new THREE.Vector3()).length());
   camera.updateProjectionMatrix();
 
-  status(`${name}: ${tris.length} triangles → ${room.count} surfels, r = ${room.surfelRadius.toFixed(3)} m` +
+  status(`${name}: ${bvh.triangles} triangles, BVH of ${bvh.nodeCount} nodes (depth ${bvh.depth}, ${buildMs.toFixed(0)} ms)` +
     (customAbs ? `, absorption ${abs.join(' / ')}` : '') + (customSc ? `, scattering ${sc}` : ''));
   requestTrace(0);
 }
 
 /* ---------------------------------------------------------------- settings panel */
-// rays are traced in batches of RAY_TEX^2: a bigger per-pass texture risks the GPU watchdog (each ray scans every
-// surfel). The slider steps through RAY_COUNTS: 2048 and 4096 for quick previews, then half batches (RAY_STEP);
+// rays are traced in batches of RAY_TEX^2: a bigger per-pass texture risks the GPU watchdog on big rooms (one pass
+// traces one bounce of every ray in the batch). The slider steps through RAY_COUNTS: 2048 and 4096 for quick previews, then half batches (RAY_STEP);
 // an odd count ends with a half batch. Every count is whole rows of RAY_TEX, which the tracer needs.
 const RAY_TEX = 128, RAY_STEP = RAY_TEX * RAY_TEX / 2;
 const RAY_COUNTS = [2048, 4096, ...Array.from({ length: 64 }, (_, i) => (i + 1) * RAY_STEP)];
@@ -379,10 +347,13 @@ async function trace() {
     const omni = tracer.readOmni(), directional = tracer.readDirectional();
     const ir = await aur.setRIRFromTracer(tracer, { omni, directional });   // builds IRs, cross-fades convolvers
     drawEchogram(omni, tracer.opts.numBins);
-    setDebugData(directional, tracer.directPath());
-    status(`RIR ready (${((performance.now() - t0) / 1000).toFixed(1)} s)` +
-      (bounces < tracer.opts.maxBounces ? ` · ${bounces} bounces, later ones are below −${tracer.opts.minEnergyDb} dB` : '') +
-      (ir.level < 1 ? ` · turned down ${(-20 * Math.log10(ir.level)).toFixed(1)} dB to avoid clipping` : ''));
+    const direct = tracer.directPath();
+    setDebugData(directional, direct);
+    status(`RIR ready (${((performance.now() - t0) / 1000).toFixed(1)} s)` //+
+      // (direct.visible ? '' : ' · no line of sight: direct sound blocked') +
+      // (bounces < tracer.opts.maxBounces ? ` · ${bounces} bounces, later ones are below −${tracer.opts.minEnergyDb} dB` : '') +
+           // (ir.level < 1 ? ` · turned down ${(-20 * Math.log10(ir.level)).toFixed(1)} dB to avoid clipping` : '')
+          );
     $('play').disabled = false;
     $('export').disabled = false;
   } catch (e) {
@@ -616,9 +587,10 @@ function drawRirTexture() {
   }
   g.putImageData(img, 0, 0);
 
-  // direct sound: should sit on a bright spot (shown when its slice is selected, or in the combined view)
-  const { distance, direction: d } = dbg.direct, ds = Math.floor(distance / o.speedOfSound / o.sliceDuration);
-  if (slice < 0 || slice === ds) {
+  // direct sound: should sit on a bright spot (shown when its slice is selected, or in the combined view; not when
+  // blocked)
+  const { distance, direction: d, visible } = dbg.direct, ds = Math.floor(distance / o.speedOfSound / o.sliceDuration);
+  if (visible && (slice < 0 || slice === ds)) {
     const u = Math.atan2(d.x, -d.z) / (2 * Math.PI) + 0.5, v = Math.asin(THREE.MathUtils.clamp(d.y, -1, 1)) / Math.PI + 0.5;
     g.strokeStyle = '#fff'; g.lineWidth = 0.75;
     g.beginPath(); g.arc(u * W, (1 - v) * H, 3, 0, 2 * Math.PI); g.stroke();

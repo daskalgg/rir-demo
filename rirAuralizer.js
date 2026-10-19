@@ -508,7 +508,8 @@ export class RIRAuralizer {
       numSlices: o.numSlices, sliceDuration: o.sliceDuration,
       speedOfSound: o.speedOfSound,
       airAbsorption: [...o.airAbsorption],
-      direct: { distance: dp.distance, direction: [dp.direction.x, dp.direction.y, dp.direction.z] },
+      // no line of sight (a wall in between): no direct sound, only what the rays carried around
+      direct: dp.visible ? { distance: dp.distance, direction: [dp.direction.x, dp.direction.y, dp.direction.z] } : null,
       worldFrame: !o.cameraRelative,
     });
   }

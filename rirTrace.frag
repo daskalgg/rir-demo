@@ -1,9 +1,11 @@
 // rirTrace.frag  (GLSL ES 3.00 body; Three.js prepends #version + precision via glslVersion: THREE.GLSL3)
 //
 // One fragment == one ray. Each pass advances every ray by ONE bounce.
-// Geometry comes from two float textures (one texel == one surfel / disc):
-//   uTex1 = [ p.x, p.y, p.z, n.x ]
-//   uTex2 = [ n.y, n.z, 0,   0   ]
+// Geometry: the room's triangles under a BVH (built on the CPU by makeBVHTextures in rirTracer.js), in two float
+// textures BVH_TEX_W texels wide; texel i sits at (i % BVH_TEX_W, i / BVH_TEX_W).
+//   uBVHNodes, 2 texels per node:  [ min.xyz, a ]  [ max.xyz, count ]
+//              leaf (count > 0): triangles a .. a + count - 1;  inner (count == 0): children a and a + 1
+//   uBVHTris,  3 texels per triangle:  [ v0.xyz, n.x ]  [ v1 - v0, n.y ]  [ v2 - v0, n.z ]   (n = unit face normal)
 //
 // Ray state (ping-pong, 3 render targets / MRT outputs):
 //   outState0 = [ origin.xyz, pathLength ]
@@ -19,8 +21,8 @@
 //            dir  = ( cos(lat) sin(lon),  sin(lat), -cos(lat) cos(lon) )
 //   "dir" points from the listener TOWARDS the sound source / reflection the energy came from.
 
-uniform sampler2D uTex1;
-uniform sampler2D uTex2;
+uniform sampler2D uBVHNodes;
+uniform sampler2D uBVHTris;
 uniform sampler2D uState0;
 uniform sampler2D uState1;
 
@@ -31,7 +33,6 @@ uniform vec3  uSource;
 uniform vec3  uListener;        // = camera world position (set by the JS driver)
 uniform mat3  uWorldToListener; // = inverse of the camera's world rotation
 uniform float uListenerRadius;  // detection sphere radius (m)
-uniform float uSurfelRadius;    // disc radius, ~0.7 * sqrt(totalSurfaceArea / numSurfels)
 uniform float uMaxPathLength;   // c * maxTime (m)
 uniform float uScattering;      // 0 = purely specular, 1 = purely diffuse
 
@@ -45,6 +46,11 @@ const float PI  = 3.14159265358979;
 // (Keep OFFSET >> float32 ulp of your coordinates: ~1e-6 at 5 m, ~4e-6 at 30 m.)
 const float OFFSET = 1e-4;
 const float T_MIN  = 1e-5;
+const float BARY_EPS = 1e-6;   // barycentric slack, so rays can't slip through the shared edge of two triangles
+
+const int BVH_TEX_W = 2048;    // = BVH_TEX_W in rirTracer.js
+const int STACK = 48;          // > the builder's MAX_DEPTH
+const int MAX_STEPS = 4096;    // traversal guard (GPU watchdog), never reached on a sane BVH
 
 // ---------------------------------------------------------------- RNG (PCG)
 uint pcg(uint v) {
@@ -69,6 +75,67 @@ vec2 arrivalUV(vec3 travelDirWorld) {
     float u = (abs(dl.x) + abs(dl.z) < 1e-6) ? 0.5 : atan(dl.x, -dl.z) / (2.0 * PI) + 0.5;
     float v = asin(clamp(dl.y, -1.0, 1.0)) / PI + 0.5;
     return vec2(u, v);
+}
+
+// ---------------------------------------------------------------- BVH
+vec4 bvhTexel(sampler2D tex, int i) { return texelFetch(tex, ivec2(i % BVH_TEX_W, i / BVH_TEX_W), 0); }
+
+// entry distance of the ray into box [lo, hi] (<= 0 if it starts inside), or 1e30 if it misses / is behind
+float boxEntry(vec3 lo, vec3 hi, vec3 o, vec3 invD) {
+    vec3 t0 = (lo - o) * invD, t1 = (hi - o) * invD;
+    vec3 tn = min(t0, t1), tf = max(t0, t1);
+    float tNear = max(max(tn.x, tn.y), tn.z), tFar = min(min(tf.x, tf.y), tf.z);
+    return (tNear <= tFar && tFar > 0.0) ? tNear : 1e30;
+}
+
+// nearest triangle hit (t > T_MIN) along o + t d; returns t (1e30: none) and its face normal in nHit
+float traceBVH(vec3 o, vec3 d, out vec3 nHit) {
+    vec3  s    = vec3(greaterThanEqual(d, vec3(0.0))) * 2.0 - 1.0;
+    vec3  invD = s / max(abs(d), vec3(1e-20));           // no division by zero on axis-aligned rays
+    float tHit = 1e30;
+    nHit = vec3(0.0, 1.0, 0.0);
+
+    // stack of pending nodes as (a, count, entry distance): a node's own texels hold what's needed to visit it
+    vec3 stack[STACK];
+    int  sp = 0;
+    {
+        vec4 lo = bvhTexel(uBVHNodes, 0), hi = bvhTexel(uBVHNodes, 1);
+        float t = boxEntry(lo.xyz, hi.xyz, o, invD);
+        if (t < tHit) stack[sp++] = vec3(lo.w, hi.w, t);
+    }
+    for (int step = 0; step < MAX_STEPS && sp > 0; step++) {
+        vec3 e = stack[--sp];
+        if (e.z >= tHit) continue;                         // a closer hit was found since this was pushed
+        int a = int(e.x), count = int(e.y);
+        if (count > 0) {                                   // leaf: Moller-Trumbore against each triangle
+            for (int k = 0; k < count; k++) {
+                int  i  = 3 * (a + k);
+                vec4 t0 = bvhTexel(uBVHTris, i), t1 = bvhTexel(uBVHTris, i + 1), t2 = bvhTexel(uBVHTris, i + 2);
+                vec3 e1 = t1.xyz, e2 = t2.xyz;
+                vec3 pv = cross(d, e2);
+                float det = dot(e1, pv);
+                if (abs(det) < 1e-12) continue;            // ray parallel to the triangle
+                float inv = 1.0 / det;
+                vec3 tv = o - t0.xyz;
+                float u = dot(tv, pv) * inv;
+                if (u < -BARY_EPS || u > 1.0 + BARY_EPS) continue;
+                vec3 qv = cross(tv, e1);
+                float v = dot(d, qv) * inv;
+                if (v < -BARY_EPS || u + v > 1.0 + BARY_EPS) continue;
+                float t = dot(e2, qv) * inv;
+                if (t > T_MIN && t < tHit) { tHit = t; nHit = vec3(t0.w, t1.w, t2.w); }
+            }
+        } else {                                           // inner: push the children it hits, nearer one on top
+            vec4 lo0 = bvhTexel(uBVHNodes, 2 * a),     hi0 = bvhTexel(uBVHNodes, 2 * a + 1);
+            vec4 lo1 = bvhTexel(uBVHNodes, 2 * a + 2), hi1 = bvhTexel(uBVHNodes, 2 * a + 3);
+            vec3 c0 = vec3(lo0.w, hi0.w, boxEntry(lo0.xyz, hi0.xyz, o, invD));
+            vec3 c1 = vec3(lo1.w, hi1.w, boxEntry(lo1.xyz, hi1.xyz, o, invD));
+            if (c0.z > c1.z) { vec3 tmp = c0; c0 = c1; c1 = tmp; }
+            if (c1.z < tHit && sp < STACK) stack[sp++] = c1;
+            if (c0.z < tHit && sp < STACK) stack[sp++] = c0;
+        }
+    }
+    return tHit;
 }
 
 // ---------------------------------------------------------------- main
@@ -101,32 +168,11 @@ void main() {
     vec3  d  = s1.xyz;
     float nb = s1.w;
 
-    // nearest surfel (ray vs. oriented disc, brute force)
-    ivec2 gs = textureSize(uTex1, 0);
-    int   N  = gs.x * gs.y;
-    float r2 = uSurfelRadius * uSurfelRadius;
+    // nearest surface along the ray
+    vec3  nHit;
+    float tHit = traceBVH(o, d, nHit);
 
-    float tHit = 1e30;
-    vec3  nHit = vec3(0.0, 1.0, 0.0);
-
-    for (int i = 0; i < N; i++) {
-        ivec2 tc = ivec2(i % gs.x, i / gs.x);
-        vec4 a = texelFetch(uTex1, tc, 0);
-        vec2 b = texelFetch(uTex2, tc, 0).xy;
-        vec3 p = a.xyz;
-        vec3 n = vec3(a.w, b.x, b.y);
-
-        float dn = dot(d, n);
-        if (abs(dn) < 1e-5) continue;
-        float t = dot(p - o, n) / dn;
-        if (t < T_MIN || t >= tHit) continue;
-        vec3 q = o + d * t - p;
-        if (dot(q, q) > r2) continue;
-        tHit = t;
-        nHit = n;
-    }
-
-    if (tHit > 1e29) {                       // escaped through a gap -> kill ray
+    if (tHit > 1e29) {                       // left the room (open geometry) -> kill ray
         outState0 = s0;
         outState1 = vec4(d, -1.0);
         return;
@@ -152,7 +198,7 @@ void main() {
     // bounce
     float newL = L + tHit;
     vec3  P    = o + d * tHit;
-    vec3  n    = (dot(nHit, d) > 0.0) ? -nHit : nHit;     // two-sided surfels
+    vec3  n    = (dot(nHit, d) > 0.0) ? -nHit : nHit;     // two-sided surfaces
 
     vec3 dNew;
     if (rnd(rng) < uScattering) {

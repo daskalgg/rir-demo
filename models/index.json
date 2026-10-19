@@ -34,5 +34,9 @@
   {
     "file": "flat-chamber.glb",
     "name": "Flat chamber"
+  },
+  {
+    "file": "maze.glb",
+    "name": "Maze"
   }
 ]

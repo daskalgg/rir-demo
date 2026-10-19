@@ -16,11 +16,10 @@
 //
 // Usage:
 //   const frag = await (await fetch('./rirTrace.frag')).text();
-//   const [tex1, tex2] = makeSurfelTextures(positions, normals, 64, 64);
+//   const bvh = makeBVHTextures(triangles);         // Float32Array, 9 floats (3 vertices) per triangle
 //   const tracer = new RIRTracer(renderer, frag, {
-//       tex1, tex2, camera,
+//       bvh, camera,
 //       source: new THREE.Vector3(2, 1.5, 3),
-//       surfelRadius: 0.7 * Math.sqrt(totalArea / (64 * 64)),
 //   });
 //   tracer.run();                                   // call again whenever camera/source moves
 //   material.map = tracer.directional;              // or sample a tile via tracer.sliceTransform(i)
@@ -140,7 +139,6 @@ export class RIRTracer {
       absorption:    [0.10, 0.10, 0.12, 0.15, 0.18, 0.20, 0.22, 0.25],   // per band (BANDS), energy
       // energy attenuation of air, 1/m (ISO 9613-1, 20 °C, 50 % RH)
       airAbsorption: [1.0e-4, 3.0e-4, 6.3e-4, 1.1e-3, 2.3e-3, 6.8e-3, 2.4e-2, 8.6e-2],
-      surfelRadius: 0.1,
       // fine omni histogram
       numBins: 2048, binDuration: 0.0005,                         // ~1.02 s
       // directional atlas
@@ -168,14 +166,13 @@ export class RIRTracer {
       vertexShader: FULLSCREEN_VERT,
       fragmentShader: traceFragSource,
       uniforms: {
-        uTex1: { value: o.tex1 }, uTex2: { value: o.tex2 },
+        uBVHNodes: { value: o.bvh.nodes }, uBVHTris: { value: o.bvh.tris },
         uState0: { value: null }, uState1: { value: null },
         uInit: { value: 1 }, uSeed: { value: 0 }, uRayTexSize: { value: o.rayTexSize },
         uSource: { value: o.source },
         uListener: { value: this._listenerPos },
         uWorldToListener: { value: this._worldToListener },
         uListenerRadius: { value: o.listenerRadius },
-        uSurfelRadius: { value: o.surfelRadius },
         uMaxPathLength: { value: o.speedOfSound * Math.max(o.numBins * o.binDuration, o.numSlices * o.sliceDuration) },
         uScattering: { value: o.scattering },
       },
@@ -233,6 +230,15 @@ export class RIRTracer {
 
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     this.setRayCount(o.rays);
+  }
+
+  /** Replaces the room geometry (from makeBVHTextures) and disposes the previous textures. Takes effect on the next
+   *  run(). */
+  setGeometry(bvh) {
+    const u = this.traceMat.uniforms;
+    u.uBVHNodes.value.dispose(); u.uBVHTris.value.dispose();
+    u.uBVHNodes.value = bvh.nodes; u.uBVHTris.value = bvh.tris;
+    this.opts.bvh = bvh;
   }
 
   /** Total rays, rounded down to whole rows of the ray texture (>= one row). Runs as full rayTexSize^2 batches plus
@@ -352,12 +358,14 @@ export class RIRTracer {
     return { directional: this.directional, omni: this.omni, bounces };
   }
 
-  /** Source distance and direction (in the same frame as the directional output). Valid after run(). */
+  /** Source distance and direction (in the same frame as the directional output), and whether the straight line
+   *  between them is free of geometry (CPU test against the BVH). Valid after run(). */
   directPath() {
     const d = this.opts.source.clone().sub(this._listenerPos);
     const distance = d.length();
+    const visible = !segmentBlocked(this.opts.bvh, this._listenerPos, d.clone().divideScalar(distance), distance);
     d.normalize().applyMatrix3(this._worldToListener);
-    return { distance, direction: d };
+    return { distance, direction: d, visible };
   }
 
   /** texture.repeat / texture.offset that select time-slice i from the atlas. */
@@ -403,20 +411,181 @@ export class RIRTracer {
   }
 }
 
-/** Helper: pack surfels into the two input textures in the requested layout. */
-export function makeSurfelTextures(positions, normals, width, height) {
-  const n = width * height;
-  const d1 = new Float32Array(n * 4), d2 = new Float32Array(n * 4);
-  for (let i = 0; i < n; i++) {
-    d1.set([positions[3*i], positions[3*i+1], positions[3*i+2], normals[3*i]], i * 4);   // [p.x p.y p.z n.x]
-    d2.set([normals[3*i+1], normals[3*i+2], 0, 0], i * 4);                               // [n.y n.z 0 0]
+/* ---------------------------------------------------------------- BVH */
+/** True if any triangle of bvh (from makeBVHTextures) crosses o + t d for 0 < t < length (CPU twin of traceBVH in
+ *  rirTrace.frag; any hit will do, so no ordering). Ends are excluded by 1e-4 m: source / listener on a wall pass. */
+function segmentBlocked(bvh, o, d, length) {
+  const N = bvh.nodes.image.data, T = bvh.tris.image.data, EPS = 1e-6, tMin = 1e-4, tMax = length - 1e-4;
+  const ox = o.x, oy = o.y, oz = o.z, dx = d.x, dy = d.y, dz = d.z;
+  const inv = (c) => (c >= 0 ? 1 : -1) / Math.max(Math.abs(c), 1e-20);   // as in the shader: no 0 * Infinity = NaN
+  const ix = inv(dx), iy = inv(dy), iz = inv(dz);
+  const boxHit = (n) => {
+    const k = 8 * n;
+    let t0 = (N[k] - ox) * ix, t1 = (N[k + 4] - ox) * ix, lo = Math.min(t0, t1), hi = Math.max(t0, t1);
+    t0 = (N[k + 1] - oy) * iy; t1 = (N[k + 5] - oy) * iy; lo = Math.max(lo, Math.min(t0, t1)); hi = Math.min(hi, Math.max(t0, t1));
+    t0 = (N[k + 2] - oz) * iz; t1 = (N[k + 6] - oz) * iz; lo = Math.max(lo, Math.min(t0, t1)); hi = Math.min(hi, Math.max(t0, t1));
+    return lo <= hi && hi > tMin && lo < tMax;
+  };
+  const stack = [0];
+  while (stack.length) {
+    const n = stack.pop();
+    if (!boxHit(n)) continue;
+    const a = N[8 * n + 3], count = N[8 * n + 7];
+    if (!count) { stack.push(a, a + 1); continue; }
+    for (let k = 3 * a * 4, end = 3 * (a + count) * 4; k < end; k += 12) {   // Moller-Trumbore, as in the shader
+      const e1x = T[k + 4], e1y = T[k + 5], e1z = T[k + 6], e2x = T[k + 8], e2y = T[k + 9], e2z = T[k + 10];
+      const px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z, pz = dx * e2y - dy * e2x;
+      const det = e1x * px + e1y * py + e1z * pz;
+      if (Math.abs(det) < 1e-12) continue;
+      const inv = 1 / det, tx = ox - T[k], ty = oy - T[k + 1], tz = oz - T[k + 2];
+      const u = (tx * px + ty * py + tz * pz) * inv;
+      if (u < -EPS || u > 1 + EPS) continue;
+      const qx = ty * e1z - tz * e1y, qy = tz * e1x - tx * e1z, qz = tx * e1y - ty * e1x;
+      const v = (dx * qx + dy * qy + dz * qz) * inv;
+      if (v < -EPS || u + v > 1 + EPS) continue;
+      const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+      if (t > tMin && t < tMax) return true;
+    }
   }
-  const mk = (data) => {
-    const t = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
+  return false;
+}
+
+// Layout read by rirTrace.frag (see its header). Width = the minimum MAX_TEXTURE_SIZE of WebGL2.
+const BVH_TEX_W = 2048;
+const LEAF_SIZE = 4;        // stop splitting at this many triangles...
+const MAX_LEAF = 16;        // ...and keep splitting above this many even if the SAH prefers a leaf
+const MAX_DEPTH = 40;       // < STACK in rirTrace.frag
+const SAH_BINS = 16;
+
+/**
+ * Builds a BVH (binned surface area heuristic) over triangles and packs it into the two textures the trace shader
+ * reads. tris: Float32Array, 9 floats (v0, v1, v2) per triangle; degenerate triangles are dropped.
+ * Returns { nodes, tris, triangles, nodeCount, depth } (textures + stats).
+ */
+export function makeBVHTextures(tris) {
+  // per-triangle bounds and centroids, skipping degenerate ones
+  let n = tris.length / 9;
+  const keep = [];
+  for (let t = 0; t < n; t++) {
+    const p = (k) => tris[9 * t + k];
+    const ux = p(3) - p(0), uy = p(4) - p(1), uz = p(5) - p(2), vx = p(6) - p(0), vy = p(7) - p(1), vz = p(8) - p(2);
+    if (Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx) > 2e-9) keep.push(t);
+  }
+  n = keep.length;
+  if (!n) throw new Error('no triangles');
+  const bmin = new Float32Array(3 * n), bmax = new Float32Array(3 * n), cen = new Float32Array(3 * n);
+  keep.forEach((t, i) => {
+    for (let c = 0; c < 3; c++) {
+      const a = tris[9 * t + c], b = tris[9 * t + 3 + c], d = tris[9 * t + 6 + c];
+      bmin[3 * i + c] = Math.min(a, b, d); bmax[3 * i + c] = Math.max(a, b, d); cen[3 * i + c] = (a + b + d) / 3;
+    }
+  });
+
+  const idx = new Uint32Array(n).map((_, i) => i);
+  const maxNodes = 2 * n - 1;
+  const nlo = new Float32Array(3 * maxNodes), nhi = new Float32Array(3 * maxNodes);
+  const nA = new Uint32Array(maxNodes), nCount = new Uint32Array(maxNodes);
+  let nodeCount = 1, depth = 0;
+  const area = (dx, dy, dz) => (dx < 0 ? 0 : dx * dy + dy * dz + dz * dx);
+  const binLo = new Float64Array(3 * SAH_BINS), binHi = new Float64Array(3 * SAH_BINS), binN = new Uint32Array(SAH_BINS);
+  const rightArea = new Float64Array(SAH_BINS), rightN = new Uint32Array(SAH_BINS);
+
+  const stack = [[0, 0, n, 0]];                  // [node, first, count, depth]
+  while (stack.length) {
+    const [node, first, count, d] = stack.pop();
+    depth = Math.max(depth, d);
+    // node bounds and centroid bounds
+    const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+    const clo = [Infinity, Infinity, Infinity], chi = [-Infinity, -Infinity, -Infinity];
+    for (let k = first; k < first + count; k++) {
+      const i = idx[k];
+      for (let c = 0; c < 3; c++) {
+        lo[c] = Math.min(lo[c], bmin[3 * i + c]); hi[c] = Math.max(hi[c], bmax[3 * i + c]);
+        clo[c] = Math.min(clo[c], cen[3 * i + c]); chi[c] = Math.max(chi[c], cen[3 * i + c]);
+      }
+    }
+    nlo.set(lo, 3 * node); nhi.set(hi, 3 * node);
+    const makeLeaf = () => { nA[node] = first; nCount[node] = count; };
+    if (count <= LEAF_SIZE || d >= MAX_DEPTH) { makeLeaf(); continue; }
+
+    // best split over SAH_BINS centroid bins on each axis; cost in units of triangle tests (traversal step = 1)
+    let best = { cost: Infinity, axis: -1, bin: 0 };
+    for (let axis = 0; axis < 3; axis++) {
+      const extent = chi[axis] - clo[axis];
+      if (extent <= 1e-12) continue;
+      const scale = SAH_BINS / extent;
+      binLo.fill(Infinity); binHi.fill(-Infinity); binN.fill(0);
+      for (let k = first; k < first + count; k++) {
+        const i = idx[k], b = Math.min(SAH_BINS - 1, Math.floor((cen[3 * i + axis] - clo[axis]) * scale));
+        binN[b]++;
+        for (let c = 0; c < 3; c++) {
+          binLo[3 * b + c] = Math.min(binLo[3 * b + c], bmin[3 * i + c]);
+          binHi[3 * b + c] = Math.max(binHi[3 * b + c], bmax[3 * i + c]);
+        }
+      }
+      // sweep from the right: area / count of bins b..end
+      let rx0 = Infinity, ry0 = Infinity, rz0 = Infinity, rx1 = -Infinity, ry1 = -Infinity, rz1 = -Infinity, rn = 0;
+      for (let b = SAH_BINS - 1; b > 0; b--) {
+        rx0 = Math.min(rx0, binLo[3 * b]); ry0 = Math.min(ry0, binLo[3 * b + 1]); rz0 = Math.min(rz0, binLo[3 * b + 2]);
+        rx1 = Math.max(rx1, binHi[3 * b]); ry1 = Math.max(ry1, binHi[3 * b + 1]); rz1 = Math.max(rz1, binHi[3 * b + 2]);
+        rn += binN[b];
+        rightArea[b] = area(rx1 - rx0, ry1 - ry0, rz1 - rz0); rightN[b] = rn;
+      }
+      // sweep from the left: split between bins b - 1 and b
+      let lx0 = Infinity, ly0 = Infinity, lz0 = Infinity, lx1 = -Infinity, ly1 = -Infinity, lz1 = -Infinity, ln = 0;
+      for (let b = 1; b < SAH_BINS; b++) {
+        lx0 = Math.min(lx0, binLo[3 * b - 3]); ly0 = Math.min(ly0, binLo[3 * b - 2]); lz0 = Math.min(lz0, binLo[3 * b - 1]);
+        lx1 = Math.max(lx1, binHi[3 * b - 3]); ly1 = Math.max(ly1, binHi[3 * b - 2]); lz1 = Math.max(lz1, binHi[3 * b - 1]);
+        ln += binN[b - 1];
+        if (!ln || !rightN[b]) continue;
+        const cost = ln * area(lx1 - lx0, ly1 - ly0, lz1 - lz0) + rightN[b] * rightArea[b];
+        if (cost < best.cost) best = { cost, axis, bin: b };
+      }
+    }
+    const nodeArea = area(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+    const splitCost = 1 + best.cost / Math.max(nodeArea, 1e-30);
+    if (best.axis < 0 || (splitCost >= count && count <= MAX_LEAF)) { makeLeaf(); continue; }
+
+    // partition idx[first .. first + count) by bin; falls back to a median split if every centroid lands on one side
+    const { axis, bin } = best, scale = SAH_BINS / (chi[axis] - clo[axis]);
+    let mid = first;
+    for (let k = first; k < first + count; k++) {
+      const i = idx[k];
+      if (Math.min(SAH_BINS - 1, Math.floor((cen[3 * i + axis] - clo[axis]) * scale)) < bin) { idx[k] = idx[mid]; idx[mid++] = i; }
+    }
+    if (mid === first || mid === first + count) mid = first + (count >> 1);
+    const left = nodeCount;                      // children are adjacent: the shader finds the right one at left + 1
+    nodeCount += 2;
+    nA[node] = left; nCount[node] = 0;
+    stack.push([left + 1, mid, first + count - mid, d + 1], [left, first, mid - first, d + 1]);
+  }
+
+  // pack: nodes 2 texels each, triangles 3 texels each (in BVH order), rows of BVH_TEX_W texels
+  const texture = (texels, fill) => {
+    const h = Math.max(1, Math.ceil(texels / BVH_TEX_W)), data = new Float32Array(BVH_TEX_W * h * 4);
+    fill(data);
+    const t = new THREE.DataTexture(data, BVH_TEX_W, h, THREE.RGBAFormat, THREE.FloatType);
     t.minFilter = t.magFilter = THREE.NearestFilter;
     t.generateMipmaps = false;
     t.needsUpdate = true;
     return t;
   };
-  return [mk(d1), mk(d2)];
+  // boxes grow by BOX_PAD: a flat, axis-aligned wall has a zero-thickness box, which rounding could make rays miss
+  const BOX_PAD = 1e-4;
+  const nodes = texture(2 * nodeCount, (data) => {
+    for (let i = 0; i < nodeCount; i++) {
+      const lo = (c) => nlo[3 * i + c] - BOX_PAD, hi = (c) => nhi[3 * i + c] + BOX_PAD;
+      data.set([lo(0), lo(1), lo(2), nA[i], hi(0), hi(1), hi(2), nCount[i]], 8 * i);
+    }
+  });
+  const triTex = texture(3 * n, (data) => {
+    for (let k = 0; k < n; k++) {
+      const t = keep[idx[k]], p = (j) => tris[9 * t + j];
+      const e1 = [p(3) - p(0), p(4) - p(1), p(5) - p(2)], e2 = [p(6) - p(0), p(7) - p(1), p(8) - p(2)];
+      const nx = e1[1] * e2[2] - e1[2] * e2[1], ny = e1[2] * e2[0] - e1[0] * e2[2], nz = e1[0] * e2[1] - e1[1] * e2[0];
+      const l = Math.hypot(nx, ny, nz);
+      data.set([p(0), p(1), p(2), nx / l, ...e1, ny / l, ...e2, nz / l], 12 * k);
+    }
+  });
+  return { nodes, tris: triTex, triangles: n, nodeCount, depth };
 }

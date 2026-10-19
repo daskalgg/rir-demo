@@ -67,8 +67,7 @@ export function writeGlb(url, sceneName, parts, markers = {}, extras = undefined
     const v = (k) => p.pos.slice(3 * p.idx[i + k], 3 * p.idx[i + k] + 3);
     area += 0.5 * Math.hypot(...cross(sub(v(1), v(0)), sub(v(2), v(0))));
   }
-  console.log(`wrote ${path}: ${tris} triangles, ${area.toFixed(0)} m² ` +
-    `(≈ ${Math.sqrt(area / 4096).toFixed(2)} m surfel spacing at 64×64)`);
+  console.log(`wrote ${path}: ${tris} triangles, ${area.toFixed(0)} m²`);
   writeIndex(dirname(path));
 }
 
