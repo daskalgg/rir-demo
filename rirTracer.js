@@ -30,6 +30,20 @@ import * as THREE from 'three';
 /** Octave band centre frequencies (Hz). */
 export const BANDS = [125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
+/** Energy attenuation of air per band (BANDS), 1/m, after ISO 9613-1 (pure tone at each band centre, sea-level
+ *  pressure). tempC in °C, humidity = relative humidity in %. 20 °C / 50 % gives the default airAbsorption. */
+export function airAbsorption(tempC, humidity) {
+  const T = tempC + 273.15, T0 = 293.15, T01 = 273.16;
+  const h = humidity * 10 ** (-6.8346 * (T01 / T) ** 1.261 + 4.6151);   // molar concentration of water vapour, %
+  const frO = 24 + 4.04e4 * h * (0.02 + h) / (0.391 + h);              // relaxation frequencies of O2 / N2, Hz
+  const frN = (T / T0) ** -0.5 * (9 + 280 * h * Math.exp(-4.170 * ((T / T0) ** (-1 / 3) - 1)));
+  return BANDS.map((f) => {
+    const dBPerM = 8.686 * f * f * (1.84e-11 * (T / T0) ** 0.5 + (T / T0) ** -2.5 * (
+      0.01275 * Math.exp(-2239.1 / T) / (frO + f * f / frO) + 0.1068 * Math.exp(-3352 / T) / (frN + f * f / frN)));
+    return dBPerM / (10 * Math.LOG10E);         // dB -> energy (Neper-like) coefficient
+  });
+}
+
 const FULLSCREEN_VERT = /* glsl */`
 void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }
 `;
@@ -119,6 +133,7 @@ export class RIRTracer {
       batches: 8,                 // total rays = batches * rayTexSize^2, unless `rays` is given
       rays: undefined,            // total rays, in whole rows of rayTexSize (the last batch may be partial)
       maxBounces: 64,
+      minEnergyDb: 80,            // run() stops once the walls have absorbed this much of every band (see bounceCount)
       speedOfSound: 343,
       listenerRadius: 0.15,
       scattering: 0.2,
@@ -233,13 +248,28 @@ export class RIRTracer {
   /** Total rays = batches * rayTexSize^2. Takes effect on the next run(). */
   setBatches(batches) { this.setRayCount(batches * this.opts.rayTexSize ** 2); }
 
-  /** Bounces traced per ray. Takes effect on the next run(). */
+  /** Passes run() traces: maxBounces, capped where even the least-absorbing band has lost minEnergyDb to the walls.
+   *  Pass k traces the segment after k reflections, whose energy is (1 - a)^k, so later passes add nothing audible. */
+  bounceCount() {
+    const o = this.opts, keep = Math.max(...o.absorption.map((a) => 1 - a));
+    const needed = keep >= 1 ? Infinity : Math.floor(-o.minEnergyDb / 10 * Math.LN10 / Math.log(keep)) + 1;
+    return Math.max(1, Math.min(o.maxBounces, needed));
+  }
+
+  /** Bounces traced per ray (upper limit, see bounceCount()). Takes effect on the next run(). */
   setMaxBounces(n) { this.opts.maxBounces = n; }
 
   /** Energy absorption per octave band (BANDS), 0..1, as [8]. Takes effect on the next run(). */
   setAbsorption(a) {
     this.opts.absorption = [...a];
     const [lo, hi] = this.omniMat.uniforms.uAbsorption.value;   // shared by both accumulate materials
+    lo.fromArray(a, 0); hi.fromArray(a, 4);
+  }
+
+  /** Energy attenuation of air per band (BANDS), 1/m, as [8] (see airAbsorption()). Takes effect on the next run(). */
+  setAirAbsorption(a) {
+    this.opts.airAbsorption = [...a];
+    const [lo, hi] = this.omniMat.uniforms.uAirAbsorption.value;   // shared by both accumulate materials
     lo.fromArray(a, 0); hi.fromArray(a, 4);
   }
 
@@ -285,7 +315,7 @@ export class RIRTracer {
     }
   }
 
-  /** Runs the full simulation. Returns { directional, omni } textures. */
+  /** Runs the full simulation. Returns { directional, omni } textures and the number of bounces traced. */
   run() {
     const r = this.renderer;
     this.updateListener();
@@ -300,7 +330,7 @@ export class RIRTracer {
     for (const t of [this.omniTarget, this.dirTarget]) { r.setRenderTarget(t); r.clear(); }
 
     let seed = 1;
-    const o = this.opts, size = o.rayTexSize;
+    const o = this.opts, size = o.rayTexSize, bounces = this.bounceCount();
     for (let b = 0; b < o.batches; b++) {
       // a partial last batch traces only its first `rows` rows (scissor) and splats only those rays (draw range)
       const rows = Math.min(size, (o.rays - b * size * size) / size), partial = rows < size;
@@ -308,7 +338,7 @@ export class RIRTracer {
       this._rayGeometry.setDrawRange(0, partial ? rows * size : Infinity);
 
       this._tracePass(true, seed++);                       // emit
-      for (let k = 0; k < o.maxBounces; k++) {
+      for (let k = 0; k < bounces; k++) {
         this._tracePass(false, seed++);                    // one bounce for all rays
         this._accumulate();                                // splat listener hits
       }
@@ -319,7 +349,7 @@ export class RIRTracer {
     r.setRenderTarget(prevTarget);
     r.autoClear = prevAuto;
     r.setClearColor(prevColor, prevAlpha);
-    return { directional: this.directional, omni: this.omni };
+    return { directional: this.directional, omni: this.omni, bounces };
   }
 
   /** Source distance and direction (in the same frame as the directional output). Valid after run(). */

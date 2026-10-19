@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.mjs",
     "dev": "nodemon",
-    "models": "node models/make-amphitheater.mjs && node models/make-ellipse.mjs && node models/make-anechoic.mjs && node models/make-flat-chamber.mjs",
+    "models": "node models/make-amphitheater.mjs && node models/make-ellipse.mjs && node models/make-anechoic.mjs && node models/make-flat-chamber.mjs && node models/make-cubes.mjs",
     "index": "node models/build-index.mjs && node sounds/build-index.mjs"
   },
   "dependencies": {

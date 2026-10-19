@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "rir_room_export"
+version = "1.0.0"
+name = "RIR Room Export"
+tagline = "Export rooms as GLB for the rir-demo ray tracer"
+maintainer = "George Daskalakis <daskalgg@gmail.com>"
+type = "add-on"
+
+license = ["SPDX:GPL-3.0-or-later"]
+blender_version_min = "4.2.0"
+
+[permissions]
+files = "Write .glb rooms and the models/index.json room list"

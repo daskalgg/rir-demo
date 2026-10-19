@@ -418,6 +418,16 @@ export class RIRAuralizer {
     this.master.connect(this.limiter);
     this.limiter.connect(this.ctx.destination);
 
+    // A/B switch, see setBypass(): the reverberant path (panners / ambisonic renderers) ends in wetOut; the dry
+    // anechoic signal goes straight to master, loudness-matched to the current IR
+    this.bypass = false;
+    this.wetOut = this.ctx.createGain();
+    this.wetOut.connect(this.master);
+    this.dry = this.ctx.createGain();
+    this.dry.gain.value = 0;
+    this.input.connect(this.dry);
+    this.dry.connect(this.master);
+
     // one HRTF panner per virtual speaker; built once so a new IR never restarts the HRTF state
     this.panners = this.speakers.map((s) => {
       const pan = this.ctx.createPanner();
@@ -426,12 +436,28 @@ export class RIRAuralizer {
       pan.rolloffFactor = 0;                  // no distance gain: level is already inside the IR
       pan.refDistance = 1;
       pan.positionX.value = s[0]; pan.positionY.value = s[1]; pan.positionZ.value = s[2];
-      pan.connect(this.master);
+      pan.connect(this.wetOut);
       return pan;
     });
   }
 
   setGain(g) { this.master.gain.value = g; }
+
+  /** true: play the anechoic signal without any RIR (A/B comparison), at the loudness of the current IR (its energy
+   *  norm after headroom scaling, i.e. the RMS gain of the reverberant path for white noise). Short cross-fade. */
+  setBypass(on) {
+    this.bypass = !!on;
+    this._updateBypass();
+  }
+
+  _updateBypass() {
+    // setTargetAtTime starts from wherever the gain is, so a switch mid-fade doesn't jump (no cancel needed)
+    const t = this.ctx.currentTime, tc = 0.015;
+    // the binaural renderers come out ~2.5 dB below the IR's energy norm (measured, white noise, all modes)
+    const dryLevel = 10 ** (-2.5 / 20) * (this.bank ? this.bank.level * this.bank.norm : 1);
+    this.wetOut.gain.setTargetAtTime(this.bypass ? 0 : 1, t, tc);
+    this.dry.gain.setTargetAtTime(this.bypass ? dryLevel : 0, t, tc);
+  }
 
   /** 'speakers' or 'ambisonic' (order 1 or 3). Re-synthesises the current IR in the new format (no re-trace)
    *  and cross-fades. */
@@ -448,7 +474,7 @@ export class RIRAuralizer {
         const trim = this.ctx.createGain();
         trim.gain.value = AMBI_RENDER[order].trim;
         r.output.connect(trim);
-        trim.connect(this.master);
+        trim.connect(this.wetOut);
         this.ambi[order] = r;
         this._rotateField(this._camElements);
       }
@@ -470,13 +496,14 @@ export class RIRAuralizer {
     return this.anechoic;
   }
 
-  /** Builds the IR from a RIRTracer that has already run(). */
-  async setRIRFromTracer(tracer) {
+  /** Builds the IR from a RIRTracer that has already run(). Pass { omni, directional } if they were already read
+   *  back (tracer.readOmni() / readDirectional() stall on the GPU); they are kept, not modified. */
+  async setRIRFromTracer(tracer, { omni = tracer.readOmni(), directional = tracer.readDirectional() } = {}) {
     const o = tracer.opts, dp = tracer.directPath();
     return this.setRIR({
       bands: o.bands,
-      omni: tracer.readOmni(), numBins: o.numBins, binDuration: o.binDuration,
-      directional: tracer.readDirectional(),
+      omni, numBins: o.numBins, binDuration: o.binDuration,
+      directional,
       sliceWidth: o.sliceWidth, sliceHeight: o.sliceHeight, atlasCols: o.atlasCols,
       numSlices: o.numSlices, sliceDuration: o.sliceDuration,
       speedOfSound: o.speedOfSound,
@@ -515,6 +542,7 @@ export class RIRAuralizer {
 
     const bank = this._buildBank(ir);         // starts silent (input gain 0)
     bank.level = ir.level;
+    bank.norm = ir.norm;
     // start a little ahead: the main thread may still be busy (GPU readback) when the events reach the audio thread
     const old = this.bank, t = this.ctx.currentTime + 0.05, T = Math.max(this.crossfade, 0.01);
     if (!old) {
@@ -534,6 +562,7 @@ export class RIRAuralizer {
       setTimeout(() => this._disposeBank(old), (T + ir.length / ir.sampleRate + 0.1) * 1000);
     }
     this.bank = bank;
+    if (this.bypass) this._updateBypass();     // follow the new IR's loudness
     return ir;
   }
 

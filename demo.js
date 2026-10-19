@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { RIRTracer, makeSurfelTextures, BANDS } from './rirTracer.js';
+import { RIRTracer, makeSurfelTextures, BANDS, airAbsorption } from './rirTracer.js';
 import { RIRAuralizer } from './rirAuralizer.js';
 
 const $ = (id) => document.getElementById(id);
@@ -75,7 +75,7 @@ function meshSurfels(tris, maxCount) {
 /* ---------------------------------------------------------------- three.js scene (visual feedback only) */
 const canvas = $('view');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(devicePixelRatio);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));   // phones report 3+; not worth the fill rate
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x111111);
 scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.5));   // lights glTF (PBR) room materials
@@ -98,32 +98,69 @@ function resize() {
 }
 addEventListener('resize', resize); resize();
 
-let dragging = false;
-canvas.addEventListener('pointerdown', (e) => { dragging = true; canvas.setPointerCapture(e.pointerId); canvas.style.cursor = 'grabbing'; });
-canvas.addEventListener('pointerup', () => { dragging = false; canvas.style.cursor = 'grab'; });
+// look: drag with the mouse or one finger. Deltas come from clientX/Y (movementX/Y is unreliable for touch)
+let drag = null;                                // { id, x, y } of the pointer turning the view
+canvas.addEventListener('pointerdown', (e) => {
+  if (drag) return;                             // a second finger doesn't take over
+  drag = { id: e.pointerId, x: e.clientX, y: e.clientY };
+  canvas.setPointerCapture(e.pointerId); canvas.style.cursor = 'grabbing';
+});
+const endDrag = (e) => { if (drag?.id === e.pointerId) { drag = null; canvas.style.cursor = 'grab'; } };
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
 canvas.addEventListener('pointermove', (e) => {
-  if (!dragging) return;
-  yaw -= e.movementX * 0.004;
-  pitch = THREE.MathUtils.clamp(pitch - e.movementY * 0.004, -1.5, 1.5);
+  if (drag?.id !== e.pointerId) return;
+  yaw -= (e.clientX - drag.x) * 0.004;
+  pitch = THREE.MathUtils.clamp(pitch - (e.clientY - drag.y) * 0.004, -1.5, 1.5);
+  drag.x = e.clientX; drag.y = e.clientY;
 });
+
+// walk the listener (camera) or the source in the horizontal plane, relative to the view direction, and up / down
+function moveBy(target, forward, right, up = 0) {
+  const f = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw)), r = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+  const obj = target === 'source' ? sourceMesh : camera;
+  obj.position.addScaledVector(f, forward).addScaledVector(r, right);
+  obj.position.y += up;
+  obj.position.clamp(roomBox.min.clone().addScalar(0.3), roomBox.max.clone().subScalar(0.3));
+  sourcePos.copy(sourceMesh.position);          // uSource holds sourcePos
+}
+
+// [target, forward, right, up]; letters case-insensitive. Source up / down: Page Up / Down, or Shift + ↑ / ↓ (laptops)
+const KEYS = { w: ['listener', 1, 0, 0], s: ['listener', -1, 0, 0], d: ['listener', 0, 1, 0], a: ['listener', 0, -1, 0],
+  e: ['listener', 0, 0, 1], q: ['listener', 0, 0, -1],
+  ArrowUp: ['source', 1, 0, 0], ArrowDown: ['source', -1, 0, 0], ArrowRight: ['source', 0, 1, 0], ArrowLeft: ['source', 0, -1, 0],
+  PageUp: ['source', 0, 0, 1], PageDown: ['source', 0, 0, -1],
+  'Shift+ArrowUp': ['source', 0, 0, 1], 'Shift+ArrowDown': ['source', 0, 0, -1] };
 addEventListener('keydown', (e) => {
-    if (e.target.closest?.('input, select, textarea') || roomBox.isEmpty()) return;
-    const step = 0.25, f = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw)), r = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
-    if (e.key === 'w') camera.position.addScaledVector(f, step);
-    if (e.key === 's') camera.position.addScaledVector(f, -step);
-    if (e.key === 'd') camera.position.addScaledVector(r, step);
-    if (e.key === 'a') camera.position.addScaledVector(r, -step);
-    camera.position.clamp(roomBox.min.clone().addScalar(0.3), roomBox.max.clone().subScalar(0.3));
-
-    if (e.key == 'ArrowUp') sourceMesh.position.addScaledVector(f, step);
-    if (e.key == 'ArrowDown') sourceMesh.position.addScaledVector(f, -step);
-    if (e.key == 'ArrowRight') sourceMesh.position.addScaledVector(r, step);
-    if (e.key == 'ArrowLeft') sourceMesh.position.addScaledVector(r, -step);
-    sourceMesh.position.clamp(roomBox.min.clone().addScalar(0.3), roomBox.max.clone().subScalar(0.3));
-    sourcePos.copy(sourceMesh.position);        // uSource holds sourcePos
-
-    if (['w', 'a', 's', 'd', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) requestTrace();
+  if (e.ctrlKey || e.metaKey || e.altKey) return;   // leave browser shortcuts alone
+  const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  const move = (e.shiftKey && KEYS['Shift+' + key]) || KEYS[key];
+  if (e.target.closest?.('input, select, textarea') || roomBox.isEmpty() || !move) return;
+  e.preventDefault();                           // no page scrolling on arrows / Page Up / Down
+  const [target, f, r, u] = move, step = 0.25;
+  moveBy(target, f * step, r * step, u * step);
+  requestTrace();
 });
+
+// on-screen pad (touch devices): hold an arrow to walk the listener or the source; moved in the frame loop
+const PAD_SPEED = 1.5;                          // m/s
+let padTarget = 'listener', padDir = null;      // padDir: [forward, right, up] while an arrow is held
+for (const b of document.querySelectorAll('#pad [data-target]')) {
+  b.onclick = () => {
+    padTarget = b.dataset.target;
+    for (const o of document.querySelectorAll('#pad [data-target]')) o.classList.toggle('on', o === b);
+  };
+}
+for (const b of document.querySelectorAll('#pad [data-dir]')) {
+  b.addEventListener('pointerdown', (e) => {
+    b.setPointerCapture(e.pointerId); b.classList.add('held');
+    padDir = b.dataset.dir.split(',').map(Number);
+  });
+  const release = () => { b.classList.remove('held'); padDir = null; };
+  b.addEventListener('pointerup', release);
+  b.addEventListener('pointercancel', release);
+  b.addEventListener('contextmenu', (e) => e.preventDefault());   // long press would open a menu
+}
 
 /* ---------------------------------------------------------------- tracer + auralizer */
 const aur = new RIRAuralizer({ speakers: 'cube', crossfade: 0.4 });
@@ -149,7 +186,8 @@ async function init() {
   if (param && ![...sel.options].some((o) => o.value === param)) sel.append(new Option(param.split('/').pop(), param));
   $('room').disabled = false;
   if (!sel.options.length) { status('no rooms in models/ — open a glTF file'); return; }
-  sel.value = param || sel.options[0].value;
+  const DEFAULT_ROOM = 'models/cube-10m.glb';
+  sel.value = param || ([...sel.options].some((o) => o.value === DEFAULT_ROOM) ? DEFAULT_ROOM : sel.options[0].value);
   sel.disabled = false;
   await selectRoom();
 }
@@ -175,8 +213,9 @@ async function loadRoom(src, name) {           // src: URL string or File
       source: sourcePos,
       surfelRadius: room.surfelRadius,
       cameraRelative: false,          // directions in WORLD axes -> head tracking via AudioListener, no re-trace
-      rayTexSize: RAY_TEX, rays: +$('rays').value * RAY_STEP, maxBounces: +$('bounces').value,
+      rayTexSize: RAY_TEX, rays: rayCount(), maxBounces: +$('bounces').value,
       absorption: DEFAULT_MATERIAL.absorption, scattering: DEFAULT_MATERIAL.scattering,
+      airAbsorption: airCoefficients(),
     });
     $('trace').disabled = false;
   } else {
@@ -223,10 +262,14 @@ async function loadRoom(src, name) {           // src: URL string or File
 
 /* ---------------------------------------------------------------- settings panel */
 // rays are traced in batches of RAY_TEX^2: a bigger per-pass texture risks the GPU watchdog (each ray scans every
-// surfel). The slider counts half batches (RAY_STEP); an odd count ends with a half batch.
+// surfel). The slider steps through RAY_COUNTS: 2048 and 4096 for quick previews, then half batches (RAY_STEP);
+// an odd count ends with a half batch. Every count is whole rows of RAY_TEX, which the tracer needs.
 const RAY_TEX = 128, RAY_STEP = RAY_TEX * RAY_TEX / 2;
+const RAY_COUNTS = [2048, 4096, ...Array.from({ length: 64 }, (_, i) => (i + 1) * RAY_STEP)];
+$('rays').max = RAY_COUNTS.length - 1;
+const rayCount = () => RAY_COUNTS[+$('rays').value];
 function updateSettings() {
-  const rays = +$('rays').value * RAY_STEP, bounces = +$('bounces').value;
+  const rays = rayCount(), bounces = +$('bounces').value;
   $('raysOut').textContent = rays.toLocaleString();
   $('bouncesOut').textContent = bounces;
   if (tracer) { tracer.setRayCount(rays); tracer.setMaxBounces(bounces); }
@@ -234,6 +277,20 @@ function updateSettings() {
 $('rays').oninput = $('bounces').oninput = updateSettings;
 $('rays').onchange = $('bounces').onchange = () => requestTrace();   // on release, not on every drag step
 updateSettings();
+
+// air absorption: per-band coefficients from temperature and humidity, or none
+function airCoefficients() {
+  return $('air').checked ? airAbsorption(+$('airTemp').value, +$('airRH').value) : BANDS.map(() => 0);
+}
+function updateAir() {
+  $('airTempOut').textContent = `${$('airTemp').value} °C`;
+  $('airRHOut').textContent = `${$('airRH').value} %`;
+  $('airTemp').disabled = $('airRH').disabled = !$('air').checked;
+  if (tracer) tracer.setAirAbsorption(airCoefficients());
+}
+$('airTemp').oninput = $('airRH').oninput = updateAir;
+$('air').onchange = $('airTemp').onchange = $('airRH').onchange = () => { updateAir(); requestTrace(); };
+updateAir();
 
 // material: a preset fills in the coefficient fields; editing a field switches to "Custom"
 const coefInput = () => Object.assign(document.createElement('input'), { type: 'number', min: 0, max: 1, step: 0.01 });
@@ -316,12 +373,15 @@ async function trace() {
     status('ray tracing…');
     await new Promise((r) => setTimeout(r, 30));  // let the status repaint
     const t0 = performance.now();
-    tracer.run();
+    const { bounces } = tracer.run();
     status('synthesizing impulse response…');
-    const ir = await aur.setRIRFromTracer(tracer);   // reads back the GPU result, builds IRs, cross-fades convolvers
-    drawEchogram(tracer.readOmni(), tracer.opts.numBins);
-    setDebugData(tracer.readDirectional(), tracer.directPath());
+    // read the GPU result back once (each read stalls until the GPU is done) and share it
+    const omni = tracer.readOmni(), directional = tracer.readDirectional();
+    const ir = await aur.setRIRFromTracer(tracer, { omni, directional });   // builds IRs, cross-fades convolvers
+    drawEchogram(omni, tracer.opts.numBins);
+    setDebugData(directional, tracer.directPath());
     status(`RIR ready (${((performance.now() - t0) / 1000).toFixed(1)} s)` +
+      (bounces < tracer.opts.maxBounces ? ` · ${bounces} bounces, later ones are below −${tracer.opts.minEnergyDb} dB` : '') +
       (ir.level < 1 ? ` · turned down ${(-20 * Math.log10(ir.level)).toFixed(1)} dB to avoid clipping` : ''));
     $('play').disabled = false;
     $('export').disabled = false;
@@ -361,6 +421,9 @@ $('export').onclick = () => {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
   status(`exported ${a.download} (${(order + 1) ** 2} channels, ACN / SN3D, absolute level)`);
 };
+
+$('bypass').onchange = () => aur.setBypass($('bypass').checked);
+aur.setBypass($('bypass').checked);              // a reload may restore the checkbox
 
 let playing = false;
 $('play').onclick = async () => {
@@ -452,7 +515,7 @@ function drawEchogram(omni, nBins) {
 // hover: crosshair. Vertical line -> arrival time (and the path length sound travels in that time),
 // horizontal line -> level in dB relative to the loudest bin of any band (the top of the plot)
 let echo = null;                                // { image, duration, range } of the last drawn echogram
-$('echo').addEventListener('pointermove', (e) => {
+function echoHover(e) {
   if (!echo) return;
   const c = e.currentTarget, g = c.getContext('2d'), r = c.getBoundingClientRect();
   const x = THREE.MathUtils.clamp((e.clientX - r.left) / r.width * c.width, 0, c.width - 1);
@@ -479,16 +542,18 @@ $('echo').addEventListener('pointermove', (e) => {
   const dx = x < c.width / 2 ? c.width - dw - 6 : 6;                            // opposite side to the pointer
   const dy = y - 20 > 22 ? y - 20 : Math.min(y + 4, c.height - 18);             // above the line, clear of the time tag
   tag(dLabel, dx, dy);
+}
+$('echo').addEventListener('pointerdown', echoHover);   // touch: tap or drag to read values
+$('echo').addEventListener('pointermove', echoHover);
+$('echo').addEventListener('pointerleave', (e) => {     // a lifted finger also "leaves": keep its readout
+  if (echo && e.pointerType !== 'touch') $('echo').getContext('2d').putImageData(echo.image, 0, 0);
 });
-$('echo').addEventListener('pointerleave', () => { if (echo) $('echo').getContext('2d').putImageData(echo.image, 0, 0); });
 
 /* ---------------------------------------------------------------- debug view of the directional RIR texture */
+// red = energy per steradian (DBG_RANGE dB scale), green = energy-weighted mean path length of that energy
+// (arrival time x speed of sound, 0 .. end of the directional window); pixels below the energy floor stay black
 const DBG_RANGE = 60;                           // dB shown
-const INFERNO = [[0, 0, 4], [87, 16, 110], [188, 55, 84], [249, 142, 9], [252, 255, 164]];
-const LUT = Array.from({ length: 256 }, (_, i) => {
-  const x = i / 255 * (INFERNO.length - 1), k = Math.min(Math.floor(x), INFERNO.length - 2), f = x - k;
-  return INFERNO[k].map((c, ch) => Math.round(c + f * (INFERNO[k + 1][ch] - c)));
-});
+const dbgMaxDistance = () => tracer.opts.numSlices * tracer.opts.sliceDuration * tracer.opts.speedOfSound;
 let dbg = null;                                 // { dir, direct } from the last trace
 
 function setDebugData(dir, direct) {
@@ -508,32 +573,45 @@ function dbgValue(s, i, j, band) {
   return e / tracer.pixelSolidAngle(j);
 }
 
-// one panorama: the selected slice, or the sum of all slices (slice < 0)
+// one panorama: the selected slice, or the sum of all slices (slice < 0); per pixel the energy per steradian and
+// the energy-weighted mean path length (slice centre time x c) of that energy
 function dbgPanorama(slice, band) {
-  const o = tracer.opts, W = o.sliceWidth, H = o.sliceHeight, out = new Float32Array(W * H);
+  const o = tracer.opts, W = o.sliceWidth, H = o.sliceHeight;
+  const energy = new Float32Array(W * H), distance = new Float32Array(W * H);
   const slices = slice < 0 ? [...Array(o.numSlices).keys()] : [slice];
-  for (const s of slices) for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) out[j * W + i] += dbgValue(s, i, j, band);
-  return out;
+  for (const s of slices) {
+    const d = (s + 0.5) * o.sliceDuration * o.speedOfSound;
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+      const e = dbgValue(s, i, j, band);
+      energy[j * W + i] += e;
+      distance[j * W + i] += e * d;
+    }
+  }
+  for (let p = 0; p < W * H; p++) distance[p] = energy[p] > 0 ? distance[p] / energy[p] : 0;
+  return { energy, distance };
 }
 
 function drawRirTexture() {
   if ($('debug').hidden || !dbg) return;
   const o = tracer.opts, W = o.sliceWidth, H = o.sliceHeight;
   const band = +$('dbgBand').value, slice = +$('dbgSlice').value;
-  const pano = dbgPanorama(slice, band);
+  const pano = dbgPanorama(slice, band), maxDist = dbgMaxDistance();
 
   // single slices are normalised to the brightest pixel of ANY slice, so stepping through them shows the decay
   let max = 1e-30;
-  if (slice < 0) for (const v of pano) max = Math.max(max, v);
+  if (slice < 0) for (const v of pano.energy) max = Math.max(max, v);
   else for (let s = 0; s < o.numSlices; s++) for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) max = Math.max(max, dbgValue(s, i, j, band));
 
   const c = $('dbgCanvas'), g = c.getContext('2d');
   c.width = W; c.height = H;
   const img = g.createImageData(W, H);
   for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-    const db = 10 * Math.log10(pano[j * W + i] / max + 1e-30);
-    const p = ((H - 1 - j) * W + i) * 4;       // "up" at the top
-    img.data.set(LUT[Math.round(255 * THREE.MathUtils.clamp(1 + db / DBG_RANGE, 0, 1))], p);
+    const q = j * W + i, p = ((H - 1 - j) * W + i) * 4;   // "up" at the top
+    const level = THREE.MathUtils.clamp(1 + 10 * Math.log10(pano.energy[q] / max + 1e-30) / DBG_RANGE, 0, 1);
+    const red = Math.round(255 * level);
+    img.data[p] = red;                                                                                 // R: energy
+    img.data[p + 1] = red > 0 ? Math.round(255 * Math.min(1, pano.distance[q] / maxDist)) : 0;        // G: distance
+    img.data[p + 2] = 0;
     img.data[p + 3] = 255;
   }
   g.putImageData(img, 0, 0);
@@ -542,7 +620,7 @@ function drawRirTexture() {
   const { distance, direction: d } = dbg.direct, ds = Math.floor(distance / o.speedOfSound / o.sliceDuration);
   if (slice < 0 || slice === ds) {
     const u = Math.atan2(d.x, -d.z) / (2 * Math.PI) + 0.5, v = Math.asin(THREE.MathUtils.clamp(d.y, -1, 1)) / Math.PI + 0.5;
-    g.strokeStyle = '#4cf'; g.lineWidth = 0.75;
+    g.strokeStyle = '#fff'; g.lineWidth = 0.75;
     g.beginPath(); g.arc(u * W, (1 - v) * H, 3, 0, 2 * Math.PI); g.stroke();
   }
   dbg.view = { pano, max };
@@ -562,7 +640,7 @@ function sliceLabel(s, count = 1) {
   return `${(s * ms).toFixed(0)}–${((s + count) * ms).toFixed(0)} ms`;
 }
 
-$('dbgCanvas').addEventListener('pointermove', (e) => {
+function dbgHover(e) {
   if (!dbg?.view) return;
   const o = tracer.opts, W = o.sliceWidth, H = o.sliceHeight, { pano, max } = dbg.view;
   const r = e.currentTarget.getBoundingClientRect();
@@ -570,12 +648,39 @@ $('dbgCanvas').addEventListener('pointermove', (e) => {
   const j = THREE.MathUtils.clamp(H - 1 - Math.floor((e.clientY - r.top) / r.height * H), 0, H - 1);
   const dir = tracer.pixelDirection(i, j);
   const az = THREE.MathUtils.radToDeg(Math.atan2(dir.x, -dir.z)), el = THREE.MathUtils.radToDeg(Math.asin(dir.y));
-  const db = 10 * Math.log10(pano[j * W + i] / max + 1e-30);
-  $('dbgInfo').textContent = `az ${az.toFixed(0)}°  el ${el.toFixed(0)}°  ${db < -300 ? '−∞' : db.toFixed(1)} dB`;
-});
+  const q = j * W + i, db = 10 * Math.log10(pano.energy[q] / max + 1e-30);
+  $('dbgInfo').textContent = `az ${az.toFixed(0)}°  el ${el.toFixed(0)}°  energy ${db < -300 ? '−∞' : db.toFixed(1)} dB` +
+    (pano.energy[q] > 0 ? `  distance ${pano.distance[q].toFixed(1)} m (${(pano.distance[q] / o.speedOfSound * 1000).toFixed(1)} ms)` : '');
+}
+$('dbgCanvas').addEventListener('pointerdown', dbgHover);
+$('dbgCanvas').addEventListener('pointermove', dbgHover);
+
+/* ---------------------------------------------------------------- panel layout */
+// narrow screens and touch devices: the panel is a sheet at the top, collapsed at start so the room is visible, and the debug
+// view lives inside it (it would otherwise cover the move pad). The media query matches the one in demo.html.
+const narrow = matchMedia('(max-width: 820px), (pointer: coarse)');
+function setPanelOpen(open) {
+  $('more').hidden = !open;
+  document.body.classList.toggle('panel-open', open);
+  $('toggleUi').textContent = open ? 'Hide' : 'Settings';
+  $('toggleUi').setAttribute('aria-expanded', open);
+}
+$('toggleUi').onclick = () => setPanelOpen($('more').hidden);
+function placeDebug() {
+  (narrow.matches ? $('more') : document.body).insertBefore($('debug'), narrow.matches ? null : $('pad'));
+}
+narrow.addEventListener('change', placeDebug);
+placeDebug();
+setPanelOpen(!narrow.matches);
 
 /* ---------------------------------------------------------------- loop */
-renderer.setAnimationLoop(() => {
+let lastFrame = 0;
+renderer.setAnimationLoop((t) => {
+  const dt = Math.min((t - lastFrame) / 1000, 0.1); lastFrame = t;
+  if (padDir && !roomBox.isEmpty()) {
+    moveBy(padTarget, ...padDir.map((v) => v * PAD_SPEED * dt));
+    requestTrace();                             // debounced: traces once the arrow is released
+  }
   camera.rotation.set(pitch, yaw, 0);
   renderer.render(scene, camera);
   aur.setListenerFromCamera(camera);            // head tracking
