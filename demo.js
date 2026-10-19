@@ -8,14 +8,11 @@ const status = (s) => { $('status').textContent = s; };
 
 const DEFAULT_MATERIAL = { absorption: [0.20, 0.22, 0.25, 0.27, 0.30, 0.33, 0.35, 0.37], scattering: 0.2 };
 const MATERIALS = [
-  //                                                                 125   250   500   1k    2k    4k    8k    16k
-  // uniform test materials: the same absorption in every band
   { id: 'abs0',     label: 'Uniform, no absorption (0)',   absorption: [0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00], scattering: 0.20 },
   { id: 'abs20',    label: 'Uniform, absorption 0.2',      absorption: [0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20], scattering: 0.20 },
   { id: 'abs50',    label: 'Uniform, absorption 0.5',      absorption: [0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50], scattering: 0.20 },
   { id: 'abs70',    label: 'Uniform, absorption 0.7',      absorption: [0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70, 0.70], scattering: 0.20 },
   { id: 'abs100',   label: 'Uniform, full absorption (1)', absorption: [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00], scattering: 0.20 },
-  // real materials
   { id: 'concrete', label: 'Concrete (smooth)',            absorption: [0.01, 0.01, 0.02, 0.02, 0.02, 0.03, 0.04, 0.05], scattering: 0.05 },
   { id: 'brick',    label: 'Brick (unglazed)',             absorption: [0.03, 0.03, 0.03, 0.04, 0.05, 0.07, 0.08, 0.09], scattering: 0.10 },
   { id: 'marble',   label: 'Marble / glazed tile',         absorption: [0.01, 0.01, 0.01, 0.01, 0.02, 0.02, 0.03, 0.03], scattering: 0.05 },
@@ -28,11 +25,10 @@ const MATERIALS = [
   { id: 'foam',     label: 'Acoustic foam (anechoic)',     absorption: [0.90, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99], scattering: 0.50 },
 ];
 const bandLabel = (f) => (f >= 1000 ? `${f / 1000}k` : `${f}`);
-const BAND_COLORS = BANDS.map((_, b) => `hsl(${(b / (BANDS.length - 1)) * 270}, 90%, 62%)`);   // red (low) -> violet (high)
-let roomMaterial = DEFAULT_MATERIAL;            // the loaded room's own material (glTF scene extras), see loadRoom
+const BAND_COLORS = BANDS.map((_, b) => `hsl(${(b / (BANDS.length - 1)) * 270}, 90%, 62%)`);
+let roomMaterial = DEFAULT_MATERIAL;
 
-/* ---------------------------------------------------------------- room (arbitrary triangle mesh, e.g. glTF) */
-function meshTriangles(root) {                  // world-space triangles of every mesh under root, 9 floats each
+function meshTriangles(root) {
   root.updateMatrixWorld(true);
   const out = [], v = new THREE.Vector3();
   root.traverse((m) => {
@@ -46,19 +42,18 @@ function meshTriangles(root) {                  // world-space triangles of ever
       }
     }
   });
-  return new Float32Array(out);                 // degenerate triangles are dropped by makeBVHTextures
+  return new Float32Array(out);
 }
 
-/* ---------------------------------------------------------------- three.js scene (visual feedback only) */
 const canvas = $('view');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));   // phones report 3+; not worth the fill rate
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x111111);
-scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.5));   // lights glTF (PBR) room materials
-let roomVisual = new THREE.Group();            // replaced by the loaded glTF scene
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 2.5));
+let roomVisual = new THREE.Group();
 scene.add(roomVisual);
-const roomBox = new THREE.Box3();               // empty until a room is loaded
+const roomBox = new THREE.Box3();
 
 const sourcePos = new THREE.Vector3();
 const sourceMesh = new THREE.Mesh(new THREE.SphereGeometry(0.12), new THREE.MeshBasicMaterial({ color: 0xff8844 }));
@@ -75,10 +70,9 @@ function resize() {
 }
 addEventListener('resize', resize); resize();
 
-// look: drag with the mouse or one finger. Deltas come from clientX/Y (movementX/Y is unreliable for touch)
-let drag = null;                                // { id, x, y } of the pointer turning the view
+let drag = null;
 canvas.addEventListener('pointerdown', (e) => {
-  if (drag) return;                             // a second finger doesn't take over
+  if (drag) return;
   drag = { id: e.pointerId, x: e.clientX, y: e.clientY };
   canvas.setPointerCapture(e.pointerId); canvas.style.cursor = 'grabbing';
 });
@@ -92,36 +86,33 @@ canvas.addEventListener('pointermove', (e) => {
   drag.x = e.clientX; drag.y = e.clientY;
 });
 
-// walk the listener (camera) or the source in the horizontal plane, relative to the view direction, and up / down
 function moveBy(target, forward, right, up = 0) {
   const f = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw)), r = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
   const obj = target === 'source' ? sourceMesh : camera;
   obj.position.addScaledVector(f, forward).addScaledVector(r, right);
   obj.position.y += up;
   obj.position.clamp(roomBox.min.clone().addScalar(0.3), roomBox.max.clone().subScalar(0.3));
-  sourcePos.copy(sourceMesh.position);          // uSource holds sourcePos
+  sourcePos.copy(sourceMesh.position);
 }
 
-// [target, forward, right, up]; letters case-insensitive. Source up / down: Page Up / Down, or Shift + ↑ / ↓ (laptops)
 const KEYS = { w: ['listener', 1, 0, 0], s: ['listener', -1, 0, 0], d: ['listener', 0, 1, 0], a: ['listener', 0, -1, 0],
   e: ['listener', 0, 0, 1], q: ['listener', 0, 0, -1],
   ArrowUp: ['source', 1, 0, 0], ArrowDown: ['source', -1, 0, 0], ArrowRight: ['source', 0, 1, 0], ArrowLeft: ['source', 0, -1, 0],
   PageUp: ['source', 0, 0, 1], PageDown: ['source', 0, 0, -1],
   'Shift+ArrowUp': ['source', 0, 0, 1], 'Shift+ArrowDown': ['source', 0, 0, -1] };
 addEventListener('keydown', (e) => {
-  if (e.ctrlKey || e.metaKey || e.altKey) return;   // leave browser shortcuts alone
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   const move = (e.shiftKey && KEYS['Shift+' + key]) || KEYS[key];
   if (e.target.closest?.('input, select, textarea') || roomBox.isEmpty() || !move) return;
-  e.preventDefault();                           // no page scrolling on arrows / Page Up / Down
+  e.preventDefault();
   const [target, f, r, u] = move, step = 0.25;
   moveBy(target, f * step, r * step, u * step);
   requestTrace();
 });
 
-// on-screen pad (touch devices): hold an arrow to walk the listener or the source; moved in the frame loop
-const PAD_SPEED = 1.5;                          // m/s
-let padTarget = 'listener', padDir = null;      // padDir: [forward, right, up] while an arrow is held
+const PAD_SPEED = 1.5;
+let padTarget = 'listener', padDir = null;
 for (const b of document.querySelectorAll('#pad [data-target]')) {
   b.onclick = () => {
     padTarget = b.dataset.target;
@@ -136,25 +127,22 @@ for (const b of document.querySelectorAll('#pad [data-dir]')) {
   const release = () => { b.classList.remove('held'); padDir = null; };
   b.addEventListener('pointerup', release);
   b.addEventListener('pointercancel', release);
-  b.addEventListener('contextmenu', (e) => e.preventDefault());   // long press would open a menu
+  b.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
-/* ---------------------------------------------------------------- tracer + auralizer */
 const aur = new RIRAuralizer({ crossfade: 0.4 });
-let tracer = null, traceFrag = null;            // the tracer is created by the first loadRoom()
+let tracer = null, traceFrag = null;
 
 async function init() {
   traceFrag = await (await fetch('./rirTrace.frag')).text();
-  aur.loadAnechoic(makeTestSignal(aur.ctx));    // "Test signal" is the first entry of the sound dropdown
+  aur.loadAnechoic(makeTestSignal(aur.ctx));
 
-  // anechoic sounds in sounds/ (index.json is written by sounds/build-index.mjs)
   let sounds = [];
   try { sounds = await (await fetch('./sounds/index.json')).json(); } catch (e) { console.warn('no sounds/index.json', e); }
   for (const snd of sounds) $('soundSelect').append(new Option(snd.name, 'sounds/' + snd.file));
 
-  await applyRenderMode();                      // loads Omnitone for the ambisonic renderer
+  await applyRenderMode();
 
-  // rooms in models/ (index.json is written by the generators / models/build-index.mjs), plus ?room=url
   let rooms = [];
   try { rooms = await (await fetch('./models/index.json')).json(); } catch (e) { console.warn('no models/index.json', e); }
   const sel = $('roomSelect');
@@ -169,37 +157,35 @@ async function init() {
   await selectRoom();
 }
 
-/* ---------------------------------------------------------------- glTF rooms */
 let loadToken = 0;
-// back to the room's start positions (markers or defaults), the listener facing the source
 const startPos = { source: new THREE.Vector3(), listener: new THREE.Vector3() };
 function resetPositions() {
-  sourcePos.copy(startPos.source);              // uSource holds this vector, so the tracer sees the change
+  sourcePos.copy(startPos.source);
   sourceMesh.position.copy(sourcePos);
   camera.position.copy(startPos.listener);
-  yaw = Math.atan2(camera.position.x - sourcePos.x, camera.position.z - sourcePos.z);   // face the source
+  yaw = Math.atan2(camera.position.x - sourcePos.x, camera.position.z - sourcePos.z);
   pitch = 0;
 }
 $('reset').addEventListener('click', () => { if (roomBox.isEmpty()) return; resetPositions(); requestTrace(0); });
 
-async function loadRoom(src, name) {           // src: URL string or File
+async function loadRoom(src, name) {
   const token = ++loadToken;
   status('loading ' + name + '…');
   const loader = new GLTFLoader();
   const gltf = typeof src === 'string'
     ? await loader.loadAsync(src)
-    : await loader.parseAsync(await src.arrayBuffer(), '');   // .glb or .gltf with embedded buffers
-  if (token !== loadToken) return;              // another room was picked meanwhile
+    : await loader.parseAsync(await src.arrayBuffer(), '');
+  if (token !== loadToken) return;
   const t0 = performance.now();
-  const bvh = makeBVHTextures(meshTriangles(gltf.scene));   // throws on a room without triangles
+  const bvh = makeBVHTextures(meshTriangles(gltf.scene));
   const buildMs = performance.now() - t0;
 
   if (!tracer) {
     tracer = new RIRTracer(renderer, traceFrag, {
       bvh, camera,
       source: sourcePos,
-      cameraRelative: false,          // directions in WORLD axes -> head tracking via AudioListener, no re-trace
-      rayTexSize: RAY_TEX, rays: rayCount(), maxBounces: +$('bounces').value,   // upper limit, see RIRTracer.plan()
+      cameraRelative: false,
+      rayTexSize: RAY_TEX, rays: rayCount(), maxBounces: +$('bounces').value,
       absorption: DEFAULT_MATERIAL.absorption, scattering: DEFAULT_MATERIAL.scattering,
       airAbsorption: airCoefficients(),
     });
@@ -207,7 +193,6 @@ async function loadRoom(src, name) {           // src: URL string or File
   } else {
     tracer.setGeometry(bvh);
   }
-  // optional room material from the glTF scene's extras: { "absorption": [one per band in BANDS], "scattering": s }
   const { absorption: abs, scattering: sc } = gltf.scene.userData;
   const customAbs = Array.isArray(abs) && abs.length === BANDS.length && abs.every((a) => a >= 0 && a <= 1);
   if (abs !== undefined && !customAbs) console.warn(`${name}: extras.absorption needs ${BANDS.length} values in 0..1 (${BANDS.join(', ')} Hz)`, abs);
@@ -216,14 +201,12 @@ async function loadRoom(src, name) {           // src: URL string or File
     absorption: customAbs ? abs : DEFAULT_MATERIAL.absorption,
     scattering: customSc ? sc : DEFAULT_MATERIAL.scattering,
   };
-  selectMaterial('room');                       // a new room starts with its own material
+  selectMaterial('room');
 
   scene.remove(roomVisual);
   roomVisual = gltf.scene;
   scene.add(roomVisual);
   roomBox.setFromObject(roomVisual);
-  // start positions: empty nodes named "Source" / "Listener" if the file has them, else fixed fractions of the
-  // bounding box
   const rel = (x, y, z) => new THREE.Vector3(x, y, z).multiply(roomBox.getSize(new THREE.Vector3())).add(roomBox.min);
   const marker = (name) => {
     let found = null;
@@ -241,10 +224,6 @@ async function loadRoom(src, name) {           // src: URL string or File
   requestTrace(0);
 }
 
-/* ---------------------------------------------------------------- settings panel */
-// rays are traced in batches of RAY_TEX^2: a bigger per-pass texture risks the GPU watchdog on big rooms (one pass
-// traces one bounce of every ray in the batch). The slider steps through RAY_COUNTS: 2048 and 4096 for quick previews, then half batches (RAY_STEP);
-// an odd count ends with a half batch. Every count is whole rows of RAY_TEX, which the tracer needs.
 const RAY_TEX = 128, RAY_STEP = RAY_TEX * RAY_TEX / 2;
 const RAY_COUNTS = [2048, 4096, ...Array.from({ length: 64 }, (_, i) => (i + 1) * RAY_STEP)];
 $('rays').max = RAY_COUNTS.length - 1;
@@ -256,10 +235,9 @@ function updateSettings() {
   if (tracer) { tracer.setRayCount(rays); tracer.setMaxBounces(bounces); }
 }
 $('rays').oninput = $('bounces').oninput = updateSettings;
-$('rays').onchange = $('bounces').onchange = () => requestTrace();   // on release, not on every drag step
+$('rays').onchange = $('bounces').onchange = () => requestTrace();
 updateSettings();
 
-// air absorption: per-band coefficients from temperature and humidity, or none
 function airCoefficients() {
   return $('air').checked ? airAbsorption(+$('airTemp').value, +$('airRH').value) : BANDS.map(() => 0);
 }
@@ -273,7 +251,6 @@ $('airTemp').oninput = $('airRH').oninput = updateAir;
 $('air').onchange = $('airTemp').onchange = $('airRH').onchange = () => { updateAir(); requestTrace(); };
 updateAir();
 
-// material: a preset fills in the coefficient fields; editing a field switches to "Custom"
 const coefInput = () => Object.assign(document.createElement('input'), { type: 'number', min: 0, max: 1, step: 0.01 });
 const coefLabel = (text, cls) => Object.assign(document.createElement('span'), { textContent: text, className: cls || '' });
 const absInputs = BANDS.map(coefInput);
@@ -315,7 +292,6 @@ for (const el of [...absInputs, $('scattering')]) {
 }
 selectMaterial('room');
 
-// room dropdown: URLs from models/index.json (+ ?room=), and files opened from disk ("local:<n>")
 const localRooms = [];
 async function selectRoom() {
   const opt = $('roomSelect').selectedOptions[0];
@@ -332,7 +308,7 @@ $('room').onchange = (e) => {
   $('roomSelect').append(new Option(`${f.name} (local file)`, `local:${localRooms.length - 1}`));
   $('roomSelect').value = `local:${localRooms.length - 1}`;
   $('roomSelect').disabled = false;
-  e.target.value = '';                          // picking the same file again still fires change
+  e.target.value = '';
   selectRoom();
 };
 
@@ -349,13 +325,12 @@ async function trace() {
   tracing = true;
   try {
     status('ray tracing…');
-    await new Promise((r) => setTimeout(r, 30));  // let the status repaint
+    await new Promise((r) => setTimeout(r, 30));
     const t0 = performance.now();
     const { bounces } = tracer.run();
     status('synthesizing impulse response…');
-    // read the GPU result back once (each read stalls until the GPU is done) and share it
     const omni = tracer.readOmni(), directional = tracer.readDirectional();
-    const ir = await aur.setRIRFromTracer(tracer, { omni, directional });   // builds IRs, cross-fades convolvers
+    const ir = await aur.setRIRFromTracer(tracer, { omni, directional });
     drawEchogram(omni, tracer.opts.numBins);
     const direct = tracer.directPath();
     setDebugData(directional, direct);
@@ -373,7 +348,6 @@ async function trace() {
 $('trace').onclick = () => trace();
 $('auto').onchange = () => requestTrace(0);
 
-// ambisonic order: switching re-synthesises the current RIR at the other order (no re-trace) and cross-fades
 async function applyRenderMode() {
   $('render').disabled = true;
   try {
@@ -388,7 +362,7 @@ async function applyRenderMode() {
 $('render').onchange = applyRenderMode;
 
 $('export').onclick = () => {
-  const { wav, order } = aur.exportAmbisonicWav();   // at the current order
+  const { wav, order } = aur.exportAmbisonicWav();
   const room = ($('roomSelect').selectedOptions[0]?.textContent || 'room').replace(/[^\w.-]+/g, '_');
   const url = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
   const a = Object.assign(document.createElement('a'), { href: url, download: `${room}-ARIR-${order}OA-AmbiX-${aur.ctx.sampleRate}Hz.wav` });
@@ -398,7 +372,7 @@ $('export').onclick = () => {
 };
 
 $('bypass').onchange = () => aur.setBypass($('bypass').checked);
-aur.setBypass($('bypass').checked);              // a reload may restore the checkbox
+aur.setBypass($('bypass').checked);
 
 let playing = false;
 $('play').onclick = async () => {
@@ -407,7 +381,6 @@ $('play').onclick = async () => {
   playing = true;
 };
 
-// sound dropdown: the test signal, URLs from sounds/index.json, and files opened from disk ("local:<n>")
 const localSounds = [];
 let soundToken = 0;
 async function selectSound() {
@@ -427,9 +400,9 @@ async function selectSound() {
       } else {
         bytes = await src.arrayBuffer();
       }
-      buf = await aur.ctx.decodeAudioData(bytes);   // resampled to the context rate
+      buf = await aur.ctx.decodeAudioData(bytes);
     }
-    if (token !== soundToken) return;           // another sound was picked meanwhile
+    if (token !== soundToken) return;
     await aur.loadAnechoic(buf);
     if (playing) await aur.play({ loop: true });
     const secs = Math.round(buf.duration);
@@ -447,20 +420,19 @@ $('file').onchange = (e) => {
   localSounds.push(f);
   $('soundSelect').append(new Option(`${f.name} (local file)`, `local:${localSounds.length - 1}`));
   $('soundSelect').value = `local:${localSounds.length - 1}`;
-  e.target.value = '';                          // picking the same file again still fires change
+  e.target.value = '';
   selectSound();
 };
 
-/* ---------------------------------------------------------------- helpers */
-function makeTestSignal(ctx) {                  // dry claps + tone bursts, so the room is easy to hear
+function makeTestSignal(ctx) {
   const fs = ctx.sampleRate, buf = ctx.createBuffer(1, fs * 6, fs), d = buf.getChannelData(0);
   [0.2, 1.7, 3.2, 4.7].forEach((t0, idx) => {
     const n0 = Math.floor(t0 * fs);
     for (let i = 0; i < 0.15 * fs; i++) {
       const env = Math.exp(-i / (0.008 * fs));
       d[n0 + i] += (idx % 2 === 0)
-        ? (Math.random() * 2 - 1) * env * 0.8                                   // clap
-        : Math.sin(2 * Math.PI * 800 * i / fs) * Math.exp(-i / (0.03 * fs)) * 0.6; // blip
+        ? (Math.random() * 2 - 1) * env * 0.8
+        : Math.sin(2 * Math.PI * 800 * i / fs) * Math.exp(-i / (0.03 * fs)) * 0.6;
     }
   });
   return buf;
@@ -471,7 +443,7 @@ function drawEchogram(omni, nBins) {
   g.clearRect(0, 0, W, H);
   let max = 1e-12;
   for (let i = 0; i < omni.length; i++) max = Math.max(max, omni[i]);
-  const range = 70, B = BANDS.length;          // dB
+  const range = 70, B = BANDS.length;
   for (let b = 0; b < B; b++) {
     g.strokeStyle = BAND_COLORS[b]; g.beginPath();
     for (let x = 0; x < W; x++) {
@@ -487,9 +459,7 @@ function drawEchogram(omni, nBins) {
   echo = { image: g.getImageData(0, 0, W, H), duration: nBins * tracer.opts.binDuration, range };
 }
 
-// hover: crosshair. Vertical line -> arrival time (and the path length sound travels in that time),
-// horizontal line -> level in dB relative to the loudest bin of any band (the top of the plot)
-let echo = null;                                // { image, duration, range } of the last drawn echogram
+let echo = null;
 function echoHover(e) {
   if (!echo) return;
   const c = e.currentTarget, g = c.getContext('2d'), r = c.getBoundingClientRect();
@@ -504,32 +474,29 @@ function echoHover(e) {
   g.stroke();
 
   g.font = '12px system-ui, sans-serif';
-  const tag = (text, lx, ly) => {               // text box with its top-left at (lx, ly)
+  const tag = (text, lx, ly) => {
     const w = g.measureText(text).width;
     g.fillStyle = '#000b'; g.fillRect(lx - 3, ly, w + 6, 17);
     g.fillStyle = '#fff'; g.fillText(text, lx, ly + 13);
   };
   const tLabel = `${(t * 1000).toFixed(1)} ms · ${(t * tracer.opts.speedOfSound).toFixed(1)} m`;
   const tw = g.measureText(tLabel).width;
-  tag(tLabel, x + 6 + tw < c.width ? x + 6 : x - 6 - tw, 3);                      // flip near the right edge
+  tag(tLabel, x + 6 + tw < c.width ? x + 6 : x - 6 - tw, 3);
 
   const dLabel = `${db.toFixed(1)} dB`, dw = g.measureText(dLabel).width;
-  const dx = x < c.width / 2 ? c.width - dw - 6 : 6;                            // opposite side to the pointer
-  const dy = y - 20 > 22 ? y - 20 : Math.min(y + 4, c.height - 18);             // above the line, clear of the time tag
+  const dx = x < c.width / 2 ? c.width - dw - 6 : 6;
+  const dy = y - 20 > 22 ? y - 20 : Math.min(y + 4, c.height - 18);
   tag(dLabel, dx, dy);
 }
-$('echo').addEventListener('pointerdown', echoHover);   // touch: tap or drag to read values
+$('echo').addEventListener('pointerdown', echoHover);
 $('echo').addEventListener('pointermove', echoHover);
-$('echo').addEventListener('pointerleave', (e) => {     // a lifted finger also "leaves": keep its readout
+$('echo').addEventListener('pointerleave', (e) => {
   if (echo && e.pointerType !== 'touch') $('echo').getContext('2d').putImageData(echo.image, 0, 0);
 });
 
-/* ---------------------------------------------------------------- debug view of the directional RIR texture */
-// red = energy per steradian (DBG_RANGE dB scale), green = energy-weighted mean path length of that energy
-// (arrival time x speed of sound, 0 .. end of the directional window); pixels below the energy floor stay black
-const DBG_RANGE = 60;                           // dB shown
+const DBG_RANGE = 60;
 const dbgMaxDistance = () => tracer.opts.numSlices * tracer.opts.sliceDuration * tracer.opts.speedOfSound;
-let dbg = null;                                 // { dir, direct } from the last trace
+let dbg = null;
 
 function setDebugData(dir, direct) {
   dbg = { dir, direct };
@@ -537,7 +504,6 @@ function setDebugData(dir, direct) {
   drawRirTexture();
 }
 
-// energy per steradian of tile pixel (i, j) in slice s (j = 0 is the bottom row, as in the texture)
 function dbgValue(s, i, j, band) {
   const o = tracer.opts, idx = ((Math.floor(s / o.atlasCols) * o.sliceHeight + j) * o.sliceWidth * o.atlasCols
                                 + (s % o.atlasCols) * o.sliceWidth + i) * BANDS.length;
@@ -548,8 +514,6 @@ function dbgValue(s, i, j, band) {
   return e / tracer.pixelSolidAngle(j);
 }
 
-// one panorama: the selected slice, or the sum of all slices (slice < 0); per pixel the energy per steradian and
-// the energy-weighted mean path length (slice centre time x c) of that energy
 function dbgPanorama(slice, band) {
   const o = tracer.opts, W = o.sliceWidth, H = o.sliceHeight;
   const energy = new Float32Array(W * H), distance = new Float32Array(W * H);
@@ -572,7 +536,6 @@ function drawRirTexture() {
   const band = +$('dbgBand').value, slice = +$('dbgSlice').value;
   const pano = dbgPanorama(slice, band), maxDist = dbgMaxDistance();
 
-  // single slices are normalised to the brightest pixel of ANY slice, so stepping through them shows the decay
   let max = 1e-30;
   if (slice < 0) for (const v of pano.energy) max = Math.max(max, v);
   else for (let s = 0; s < o.numSlices; s++) for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) max = Math.max(max, dbgValue(s, i, j, band));
@@ -581,18 +544,16 @@ function drawRirTexture() {
   c.width = W; c.height = H;
   const img = g.createImageData(W, H);
   for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-    const q = j * W + i, p = ((H - 1 - j) * W + i) * 4;   // "up" at the top
+    const q = j * W + i, p = ((H - 1 - j) * W + i) * 4;
     const level = THREE.MathUtils.clamp(1 + 10 * Math.log10(pano.energy[q] / max + 1e-30) / DBG_RANGE, 0, 1);
     const red = Math.round(255 * level);
-    img.data[p] = red;                                                                                 // R: energy
-    img.data[p + 1] = red > 0 ? Math.round(255 * Math.min(1, pano.distance[q] / maxDist)) : 0;        // G: distance
+    img.data[p] = red;
+    img.data[p + 1] = red > 0 ? Math.round(255 * Math.min(1, pano.distance[q] / maxDist)) : 0;
     img.data[p + 2] = 0;
     img.data[p + 3] = 255;
   }
   g.putImageData(img, 0, 0);
 
-  // direct sound: should sit on a bright spot (shown when its slice is selected, or in the combined view; not when
-  // blocked)
   const { distance, direction: d, visible } = dbg.direct, ds = Math.floor(distance / o.speedOfSound / o.sliceDuration);
   if (visible && (slice < 0 || slice === ds)) {
     const u = Math.atan2(d.x, -d.z) / (2 * Math.PI) + 0.5, v = Math.asin(THREE.MathUtils.clamp(d.y, -1, 1)) / Math.PI + 0.5;
@@ -631,9 +592,6 @@ function dbgHover(e) {
 $('dbgCanvas').addEventListener('pointerdown', dbgHover);
 $('dbgCanvas').addEventListener('pointermove', dbgHover);
 
-/* ---------------------------------------------------------------- panel layout */
-// narrow screens and touch devices: the panel is a sheet at the top, collapsed at start so the room is visible, and the debug
-// view lives inside it (it would otherwise cover the move pad). The media query matches the one in demo.html.
 const narrow = matchMedia('(max-width: 820px), (pointer: coarse)');
 function setPanelOpen(open) {
   $('more').hidden = !open;
@@ -649,17 +607,16 @@ narrow.addEventListener('change', placeDebug);
 placeDebug();
 setPanelOpen(!narrow.matches);
 
-/* ---------------------------------------------------------------- loop */
 let lastFrame = 0;
 renderer.setAnimationLoop((t) => {
   const dt = Math.min((t - lastFrame) / 1000, 0.1); lastFrame = t;
   if (padDir && !roomBox.isEmpty()) {
     moveBy(padTarget, ...padDir.map((v) => v * PAD_SPEED * dt));
-    requestTrace();                             // debounced: traces once the arrow is released
+    requestTrace();
   }
   camera.rotation.set(pitch, yaw, 0);
   renderer.render(scene, camera);
-  aur.setListenerFromCamera(camera);            // head tracking
+  aur.setListenerFromCamera(camera);
 });
 
 init().catch((e) => { console.error(e); status('error: ' + e.message); });

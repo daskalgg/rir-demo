@@ -1,11 +1,3 @@
-# Exports Blender scenes as rooms for the rir-demo (same layout as the models/make-*.mjs generators):
-#   - a GLB, Y-up, metres (Blender units), written by Blender's own glTF exporter
-#   - scene name = the room's name in the demo's dropdown
-#   - scene extras { "absorption": [8 bands, 125 Hz .. 16 kHz], "scattering": s }, each optional
-#   - empty marker nodes "Source" / "Listener" at the start positions
-#   - optionally rebuilds index.json next to the file (port of writeIndex in models/glb.mjs)
-#
-# The panel lives in the 3D View sidebar (N) under "RIR"; the exporter is also in File > Export.
 
 import json
 import os
@@ -15,9 +7,8 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, PointerProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper
 
-BANDS = [125, 250, 500, 1000, 2000, 4000, 8000, 16000]   # rirTracer.js BANDS
+BANDS = [125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 
-# demo.js MATERIALS (absorption per band, scattering)
 MATERIALS = [
     ('default',  'Demo default',                 [0.20, 0.22, 0.25, 0.27, 0.30, 0.33, 0.35, 0.37], 0.20),
     ('concrete', 'Concrete (smooth)',            [0.01, 0.01, 0.02, 0.02, 0.02, 0.03, 0.04, 0.05], 0.05),
@@ -66,13 +57,11 @@ class RIRRoomSettings(bpy.types.PropertyGroup):
                              description='Output .glb for the sidebar\'s Export button')
 
 
-# ---------------------------------------------------------------- export
-
 def marker_object(scene, settings, name):
     obj = getattr(settings, name.lower())
     if obj:
         return obj
-    for o in scene.objects:                     # "Source", "source", "Source.001", ...
+    for o in scene.objects:
         if o.name.split('.')[0].lower() == name.lower():
             return o
     return None
@@ -120,7 +109,7 @@ def write_index(folder):
                 with open(os.path.join(folder, file), encoding='utf-8') as f:
                     doc = json.load(f)
             name = doc.get('scenes', [{}])[doc.get('scene', 0)].get('name')
-        except Exception:                       # unreadable: fall back to the file name
+        except Exception:
             pass
         rooms.append({'file': file, 'name': name or os.path.splitext(file)[0]})
     rooms.sort(key=lambda r: r['name'].lower())
@@ -150,7 +139,6 @@ def export_room(context, filepath, settings):
         raise RuntimeError('nothing to export: no visible' + (' selected' if settings.use_selection else '') +
                            ' mesh objects')
 
-    # export exactly `objects` through the selection, then restore it
     view_layer = context.view_layer
     old_selected, old_active = list(context.selected_objects), view_layer.objects.active
     if context.mode != 'OBJECT':
@@ -168,7 +156,6 @@ def export_room(context, filepath, settings):
             o.select_set(o in old_selected)
         view_layer.objects.active = old_active
 
-    # post-process: room name, acoustic extras, Source / Listener marker nodes
     doc, bin_chunk = read_glb(filepath)
     doc.setdefault('scenes', [{'nodes': []}])
     sc = doc['scenes'][doc.setdefault('scene', 0)]
@@ -185,7 +172,7 @@ def export_room(context, filepath, settings):
     for name, obj in markers.items():
         if not obj:
             continue
-        x, y, z = obj.matrix_world.translation   # Blender Z-up -> glTF Y-up
+        x, y, z = obj.matrix_world.translation
         nodes.append({'name': name, 'translation': [round(x, 6), round(z, 6), round(-y, 6)]})
         sc.setdefault('nodes', []).append(len(nodes) - 1)
     doc.setdefault('asset', {})['generator'] = 'rir-demo Blender exporter (' + doc['asset'].get('generator', '') + ')'
@@ -199,8 +186,6 @@ def export_room(context, filepath, settings):
         msg += f', index.json: {write_index(os.path.dirname(filepath))} rooms'
     return msg
 
-
-# ---------------------------------------------------------------- operators
 
 class RIR_OT_export_room(bpy.types.Operator, ExportHelper):
     """Export the scene as a rir-demo room (.glb with acoustic extras and Source / Listener markers)"""
@@ -268,8 +253,6 @@ class RIR_OT_add_marker(bpy.types.Operator):
         setattr(context.scene.rir_room, self.marker.lower(), empty)
         return {'FINISHED'}
 
-
-# ---------------------------------------------------------------- UI
 
 def draw_settings(layout, settings, show_file=True):
     layout.use_property_split = True

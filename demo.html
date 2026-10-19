@@ -41,7 +41,6 @@
          #dbgAxis { display: flex; justify-content: space-between; color: #999; font-size: 11px; margin-top: 2px; }
          #dbgInfo { display: block; min-height: 1.2em; margin-top: 4px; color: #9cf; font-variant-numeric: tabular-nums; }
 
-         /* on-screen move pad, touch devices only (keyboard users have WASD / arrow keys) */
          #pad { display: none; position: fixed; left: calc(12px + env(safe-area-inset-left)); bottom: calc(12px + env(safe-area-inset-bottom));
              gap: 8px; justify-items: center; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
          #pad button { touch-action: none; font: 15px system-ui, sans-serif; color: #ddd; background: #000a; border: 1px solid #fff3; border-radius: 8px; }
@@ -53,9 +52,8 @@
          #pad .dpad { display: grid; grid-template: repeat(3, 48px) / repeat(3, 48px); gap: 4px; }
          #pad .dpad button { padding: 0; font-size: 20px; }
          #pad .dpad button:active, #pad .dpad button.held { background: #9cf6; }
-        #pad .dpad button.vert { font-size: 18px; border-style: dashed; }   /* up / down, in the right-hand corners */
+        #pad .dpad button.vert { font-size: 18px; border-style: dashed; }
 
-         /* touch: bigger targets, the pad, touch hints */
          @media (hover: none), (pointer: coarse) {
              #ui button, #ui select { min-height: 36px; padding: 4px 10px; }
              #settings label { min-height: 34px; }
@@ -67,8 +65,6 @@
              .mouse-only { display: none; }
          }
 
-         /* narrow screens and touch devices: the panel becomes a full-width sheet at the top (collapsed by default,
-            see demo.js), the debug view moves into it, and the coefficient table puts its row labels on their own lines */
          @media (max-width: 820px), (pointer: coarse) {
              #ui { top: 0; left: 0; right: 0; max-width: none; max-height: 65dvh; border-radius: 0 0 10px 10px;
                  padding: calc(6px + env(safe-area-inset-top)) calc(10px + env(safe-area-inset-right)) 4px calc(10px + env(safe-area-inset-left)); }
@@ -77,7 +73,6 @@
              #coefs > span:not(.head) { grid-column: 1 / -1; }
              #ui #debug { position: static; width: auto; margin-top: 8px; padding: 8px 0 4px; background: none; border-top: 1px solid #fff2; border-radius: 0; }
          }
-         /* landscape phones: no room for both, so the open sheet hides the pad */
          @media (max-height: 560px) { body.panel-open #pad { display: none; } }
         </style>
         <script type="importmap">
@@ -118,7 +113,7 @@
                         <option value="1" selected>Ambisonics, 1st order → binaural (Omnitone)</option>
                     </select></label>
                     <label><span>Material</span><select id="material"></select></label>
-                    <div id="coefs"></div>   <!-- band headers + inputs are built by demo.js from BANDS -->
+                    <div id="coefs"></div>
                     <label><input type="checkbox" id="auto" checked><span>Re-trace automatically when the listener, source or settings change</span></label>
                     <label><input type="checkbox" id="showDebug"><span>Show RIR texture (debug)</span></label>
                 </div>
@@ -128,7 +123,7 @@
             <div class="row">
                 <b>RIR texture</b>
                 <label>Band <select id="dbgBand">
-                    <option value="-1">all (sum)</option>   <!-- one option per band is added by demo.js -->
+                    <option value="-1">all (sum)</option>
                 </select></label>
                 <label>Slice <input type="range" id="dbgSlice" min="-1" max="31" step="1" value="-1"><output id="dbgSliceOut">all: 0–128 ms</output></label>
             </div>

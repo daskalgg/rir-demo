@@ -1,4 +1,3 @@
-// Tiny helpers shared by the model generators: flat-shaded mesh parts and a GLB writer.
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +9,6 @@ export const norm = (a) => { const l = Math.hypot(...a); return a.map((v) => v /
 
 export class Part {
   constructor(name, color) { Object.assign(this, { name, color, pos: [], nrm: [], idx: [] }); }
-  /** Flat convex polygon facing n (winding is fixed up to match n; repeated points, e.g. at poles, are dropped). */
   poly(pts, n) {
     pts = pts.filter((p, i) => Math.hypot(...sub(p, pts[(i + pts.length - 1) % pts.length])) > 1e-9);
     if (pts.length < 3) return;
@@ -21,7 +19,6 @@ export class Part {
   }
 }
 
-/** Writes parts (+ empty marker nodes { name: [x, y, z] }, + optional scene extras) as a GLB and prints a summary. */
 export function writeGlb(url, sceneName, parts, markers = {}, extras = undefined) {
   const chunks = [], bufferViews = [], accessors = [], meshes = [], materials = [], nodes = [];
   let offset = 0;
@@ -29,7 +26,7 @@ export function writeGlb(url, sceneName, parts, markers = {}, extras = undefined
     const bytes = Buffer.from(typed.buffer, typed.byteOffset, typed.byteLength);
     bufferViews.push({ buffer: 0, byteOffset: offset, byteLength: bytes.length, target });
     chunks.push(bytes);
-    offset += bytes.length;                     // float32 / uint32 data keeps 4-byte alignment
+    offset += bytes.length;
     return bufferViews.length - 1;
   };
   for (const part of parts) {
@@ -71,8 +68,6 @@ export function writeGlb(url, sceneName, parts, markers = {}, extras = undefined
   writeIndex(dirname(path));
 }
 
-/** Writes index.json in dir: every .glb / .gltf there as { file, name } (name = glTF scene name). The demo's room
- *  dropdown reads it — a static page can't list a folder itself. */
 export function writeIndex(dir) {
   const rooms = readdirSync(dir).filter((f) => /\.(glb|gltf)$/i.test(f)).map((file) => {
     let name;
@@ -80,7 +75,7 @@ export function writeIndex(dir) {
       const b = readFileSync(join(dir, file));
       const json = file.toLowerCase().endsWith('.glb') ? JSON.parse(b.subarray(20, 20 + b.readUInt32LE(12))) : JSON.parse(b);
       name = json.scenes?.[json.scene ?? 0]?.name;
-    } catch { /* unreadable: fall back to the file name */ }
+    } catch {  }
     return { file, name: name || file.replace(/\.(glb|gltf)$/i, '') };
   }).sort((a, b) => a.name.localeCompare(b.name));
   writeFileSync(join(dir, 'index.json'), JSON.stringify(rooms, null, 2) + '\n');

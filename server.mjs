@@ -1,8 +1,3 @@
-// Minimal static server for the demo (no dependencies). Serves this folder, including node_modules/three.
-//
-//   npm start            -> http://0.0.0.0:8080/, reachable from other devices on the network
-//                           (PORT=3000 / HOST=127.0.0.1 npm start for another port / this machine only)
-//   npm run dev          -> same, via nodemon (see nodemon.json)
 import http from 'node:http';
 import { networkInterfaces } from 'node:os';
 import { createReadStream, statSync } from 'node:fs';
@@ -26,20 +21,20 @@ http.createServer((req, res) => {
   try { path = decodeURIComponent(new URL(req.url, 'http://x').pathname); } catch { res.writeHead(400).end(); return; }
   if (path === '/') path = '/demo.html';
   const file = normalize(join(ROOT, path));
-  if (!file.startsWith(ROOT) || file.split(sep).includes('.git')) { res.writeHead(403).end(); return; }   // no ../ escapes
+  if (!file.startsWith(ROOT) || file.split(sep).includes('.git')) { res.writeHead(403).end(); return; }
   let stat;
   try { stat = statSync(file); } catch { stat = null; }
   if (!stat?.isFile()) { res.writeHead(404, { 'Content-Type': 'text/plain' }).end('not found: ' + path); return; }
   res.writeHead(200, {
     'Content-Type': TYPES[extname(file).toLowerCase()] || 'application/octet-stream',
     'Content-Length': stat.size,
-    'Cache-Control': 'no-cache',                // edits show up on reload
+    'Cache-Control': 'no-cache',
   });
   if (req.method === 'HEAD') { res.end(); return; }
   createReadStream(file).pipe(res);
 }).listen(PORT, HOST, () => {
   console.log(`RIR demo: http://${HOST}:${PORT}/`);
-  if (HOST === '0.0.0.0') {                     // the addresses other devices can use
+  if (HOST === '0.0.0.0') {
     for (const a of Object.values(networkInterfaces()).flat()) {
       if (a.family === 'IPv4' && !a.internal) console.log(`          http://${a.address}:${PORT}/`);
     }
